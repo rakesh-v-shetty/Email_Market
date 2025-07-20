@@ -259,15 +259,6 @@ def send_email_via_gmail(service, email_message):
     except HttpError as error:
         return {'success': False, 'error': str(error)}
 
-# A/B Testing functions
-def assign_variation(recipient_email, variations):
-    """Assign recipient to a variation using consistent hashing"""
-    # Use email hash to ensure consistent assignment
-    email_hash = hashlib.md5(recipient_email.encode()).hexdigest()
-    hash_int = int(email_hash[:8], 16)
-    variation_index = hash_int % len(variations)
-    return variations[variation_index]['variation_name']
-
 def calculate_ab_metrics(campaign_id):
     """Calculate A/B testing metrics for a campaign"""
     conn = get_db_connection()
@@ -524,7 +515,7 @@ def create_campaign():
 
 @app.route('/upload-recipients', methods=['POST'])
 def upload_recipients():
-    """Upload recipient list for A/B testing"""
+    """Upload recipient list and assign variations using a round-robin method for even distribution."""
     try:
         campaign_id = request.form.get('campaign_id')
         if not campaign_id:
@@ -539,7 +530,7 @@ def upload_recipients():
 
         # Read CSV file
         stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
-        csv_input = csv.DictReader(stream)
+        csv_input = list(csv.DictReader(stream)) # Read all recipients into a list first
 
         # Get campaign variations
         conn = get_db_connection()
@@ -548,15 +539,21 @@ def upload_recipients():
         cursor.execute(sql.SQL('SELECT variation_name FROM email_variations WHERE campaign_id = %s'), [campaign_id])
         variations = [{'variation_name': row[0]} for row in cursor.fetchall()]
 
-        recipients_added = 0
+        if not variations:
+            return jsonify({'success': False, 'error': 'No variations found for this campaign. Cannot assign recipients.'})
 
-        for row in csv_input:
+        recipients_added = 0
+        
+        # --- MODIFIED LOGIC: Round-Robin Assignment ---
+        for i, row in enumerate(csv_input):
             email = row.get('email', '').strip()
             if not email:
                 continue
 
-            # Assign variation
-            assigned_variation = assign_variation(email, variations)
+            # Assign variation by cycling through the variations list
+            variation_index = i % len(variations)
+            assigned_variation = variations[variation_index]['variation_name']
+            
             tracking_id = str(uuid.uuid4())
 
             cursor.execute(sql.SQL('''
@@ -579,7 +576,7 @@ def upload_recipients():
         return jsonify({
             'success': True,
             'recipients_added': recipients_added,
-            'message': f'Successfully uploaded {recipients_added} recipients'
+            'message': f'Successfully uploaded and assigned {recipients_added} recipients evenly.'
         })
 
     except Exception as e:
@@ -588,7 +585,7 @@ def upload_recipients():
 
 @app.route('/send-campaign', methods=['POST'])
 def send_campaign():
-    """Send A/B testing campaign"""
+    """Send A/B testing campaign and explicitly reset tracking fields."""
     try:
         data = request.get_json()
         campaign_id = data.get('campaign_id')
@@ -602,11 +599,10 @@ def send_campaign():
         except Exception as e:
             return jsonify({'success': False, 'error': f'Gmail authentication failed: {str(e)}'})
 
-        # Get campaign and variations
+        # Get campaign, variations, and recipients
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Get email variations
         cursor.execute(sql.SQL('''
             SELECT variation_name, subject_line, email_body
             FROM email_variations
@@ -614,7 +610,6 @@ def send_campaign():
         '''), [campaign_id])
         variations = {row[0]: {'subject': row[1], 'body': row[2]} for row in cursor.fetchall()}
 
-        # Get recipients
         cursor.execute(sql.SQL('''
             SELECT id, email_address, first_name, variation_assigned, tracking_id
             FROM recipients
@@ -630,7 +625,6 @@ def send_campaign():
         for recipient_id, email, first_name, variation, tracking_id in recipients:
             print(f"\nProcessing recipient: {email} for variation: {variation}")
             try:
-                # Get variation content
                 variation_content = variations[variation]
 
                 # Personalize content
@@ -640,44 +634,41 @@ def send_campaign():
                     body = body.replace('Hi there', f'Hi {first_name}')
                     body = body.replace('Hello!', f'Hello {first_name}!')
 
-                # Create and send email
-                print(f"  > Creating email message for {email}...")
                 email_message = create_email_message(email, subject, body, tracking_id)
-
-                print(f"  > Attempting to send via Gmail API...")
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
-                    print(f"  > SUCCESS: Email sent. Updating status to 'sent'.")
-                    # Update recipient status
+                    print(f"  > SUCCESS: Email sent. Updating status and resetting tracking fields.")
+                    
+                    # --- MODIFIED SQL QUERY ---
+                    # This query now explicitly sets tracking fields to NULL
                     cursor.execute(sql.SQL('''
                         UPDATE recipients
-                        SET status = 'sent', sent_at = CURRENT_TIMESTAMP
+                        SET 
+                            status = 'sent', 
+                            sent_at = CURRENT_TIMESTAMP,
+                            opened_at = NULL,
+                            clicked_at = NULL,
+                            converted_at = NULL
                         WHERE id = %s
                     '''), [recipient_id])
                     sent_count += 1
                 else:
                     print(f"  > FAILED: Gmail API returned an error: {result['error']}")
                     errors.append(f'{email}: {result["error"]}')
-                    cursor.execute(sql.SQL('''
-                        UPDATE recipients
-                        SET status = 'failed'
-                        WHERE id = %s
-                    '''), [recipient_id])
+                    cursor.execute(sql.SQL("UPDATE recipients SET status = 'failed' WHERE id = %s"), [recipient_id])
 
             except Exception as e:
                 print(f"  > FAILED: An exception occurred: {str(e)}")
                 errors.append(f'{email}: {str(e)}')
 
-        # Commit all the database changes at the end of the loop
         conn.commit()
+        print(f"--- Campaign sending finished. Committing changes. ---")
 
-        print(f"--- Campaign sending finished. Committing changes to database. ---")
-
-        # Update campaign status
-        cursor.execute(sql.SQL('UPDATE campaigns SET status = %s WHERE id = %s'), ('sent', campaign_id))
-
+        # Update overall campaign status
+        cursor.execute(sql.SQL("UPDATE campaigns SET status = 'sent' WHERE id = %s"), (campaign_id,))
         conn.commit()
+        
         cursor.close()
         conn.close()
 
@@ -690,6 +681,9 @@ def send_campaign():
 
     except Exception as e:
         print(f"Error in send_campaign: {e}")
+        # Ensure connection is closed in case of an early error
+        if 'conn' in locals() and conn:
+            conn.close()
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/campaign-results/<campaign_id>')
