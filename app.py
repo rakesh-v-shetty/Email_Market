@@ -623,8 +623,8 @@ def upload_recipients():
 @app.route('/send-campaign', methods=['POST'])
 def send_campaign():
     """
-    Send A/B testing campaign and starts a background thread to reset 
-    tracking fields after a 5-second delay.
+    Send A/B testing campaign, ensuring emails are dispatched correctly,
+    and starts a background thread to reset tracking fields after a 5-second delay.
     """
     try:
         data = request.get_json()
@@ -632,12 +632,12 @@ def send_campaign():
 
         if not campaign_id:
             return jsonify({'success': False, 'error': 'Campaign ID required'})
-            
-        # --- MODIFIED LOGIC: Start the background reset thread ---
-        # This thread will run independently without blocking the request.
+
+        # --- Start the background reset thread ---
+        # This thread will run independently for 5 seconds before executing.
         reset_thread = threading.Thread(target=delayed_reset, args=(campaign_id,))
         reset_thread.start()
-        # --- End of modification ---
+        # --- End of thread start ---
 
         # Authenticate Gmail
         try:
@@ -663,7 +663,11 @@ def send_campaign():
         for recipient_id, email, first_name, variation, tracking_id in recipients:
             try:
                 variation_content = variations[variation]
+
+                # FIX: Define the 'subject' variable correctly
+                subject = variation_content['subject']
                 body = variation_content['body']
+
                 if first_name:
                     body = body.replace('Hi there', f'Hi {first_name}').replace('Hello!', f'Hello {first_name}!')
 
@@ -671,7 +675,8 @@ def send_campaign():
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
-                    # This query now only updates the status and sent time. The NULL reset is handled by the thread.
+                    # This query now only updates the status and sent time.
+                    # The NULL reset is handled by the background thread.
                     cursor.execute(sql.SQL("UPDATE recipients SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = %s"), [recipient_id])
                     sent_count += 1
                 else:
@@ -684,9 +689,10 @@ def send_campaign():
         conn.commit()
         print(f"--- Campaign sending finished. Committing changes. ---")
 
+        # Update the overall campaign status
         cursor.execute(sql.SQL("UPDATE campaigns SET status = 'sent' WHERE id = %s"), (campaign_id,))
         conn.commit()
-        
+
         cursor.close()
         conn.close()
 
