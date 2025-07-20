@@ -7,7 +7,6 @@ from datetime import datetime
 import datetime
 import time
 import random
-import threading
 import hashlib
 import base64
 from premailer import transform
@@ -180,37 +179,6 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.
 LLAMA_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
 HF_API_URL = f"https://api-inference.huggingface.co/models/{LLAMA_MODEL}"
 HF_TOKEN = os.getenv('HUGGINGFACE_API_TOKEN')
-
-def delayed_reset(campaign_id):
-    """
-    Waits for 5 seconds, then sets tracking columns to NULL for a campaign.
-    This runs in a background thread to avoid blocking the main application.
-    """
-    try:
-        print(f"[{campaign_id}] Starting 5-second countdown to reset tracking columns...")
-        time.sleep(5)
-        
-        print(f"[{campaign_id}] Countdown finished. Connecting to database to reset columns.")
-        conn = None # Initialize conn to None
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Explicitly set tracking columns to NULL
-        cursor.execute(sql.SQL('''
-            UPDATE recipients 
-            SET opened_at = NULL, clicked_at = NULL, converted_at = NULL
-            WHERE campaign_id = %s
-        '''), [campaign_id])
-        
-        conn.commit()
-        print(f"[{campaign_id}] SUCCESS: Tracking columns have been reset to NULL.")
-        cursor.close()
-
-    except Exception as e:
-        print(f"[{campaign_id}] ERROR in delayed_reset thread: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 # Gmail API functions
 def authenticate_gmail():
@@ -623,8 +591,7 @@ def upload_recipients():
 @app.route('/send-campaign', methods=['POST'])
 def send_campaign():
     """
-    Send A/B testing campaign, ensuring emails are dispatched correctly,
-    and starts a background thread to reset tracking fields after a 5-second delay.
+    Sends the A/B testing campaign and reliably resets tracking columns in a single process.
     """
     try:
         data = request.get_json()
@@ -633,11 +600,18 @@ def send_campaign():
         if not campaign_id:
             return jsonify({'success': False, 'error': 'Campaign ID required'})
 
-        # --- Start the background reset thread ---
-        # This thread will run independently for 5 seconds before executing.
-        reset_thread = threading.Thread(target=delayed_reset, args=(campaign_id,))
-        reset_thread.start()
-        # --- End of thread start ---
+        # --- DB Operation: Reliably reset all tracking columns for the campaign first ---
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        print(f"[{campaign_id}] Resetting tracking columns to NULL before sending...")
+        cursor.execute(sql.SQL('''
+            UPDATE recipients
+            SET opened_at = NULL, clicked_at = NULL, converted_at = NULL
+            WHERE campaign_id = %s
+        '''), [campaign_id])
+        conn.commit()
+        print(f"[{campaign_id}] Tracking columns successfully reset.")
+        # --- End of reset operation ---
 
         # Authenticate Gmail
         try:
@@ -645,10 +619,7 @@ def send_campaign():
         except Exception as e:
             return jsonify({'success': False, 'error': f'Gmail authentication failed: {str(e)}'})
 
-        # The rest of the function continues immediately...
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
+        # Get variations and recipients
         cursor.execute(sql.SQL('SELECT variation_name, subject_line, email_body FROM email_variations WHERE campaign_id = %s'), [campaign_id])
         variations = {row[0]: {'subject': row[1], 'body': row[2]} for row in cursor.fetchall()}
 
@@ -663,11 +634,8 @@ def send_campaign():
         for recipient_id, email, first_name, variation, tracking_id in recipients:
             try:
                 variation_content = variations[variation]
-
-                # FIX: Define the 'subject' variable correctly
                 subject = variation_content['subject']
                 body = variation_content['body']
-
                 if first_name:
                     body = body.replace('Hi there', f'Hi {first_name}').replace('Hello!', f'Hello {first_name}!')
 
@@ -675,8 +643,7 @@ def send_campaign():
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
-                    # This query now only updates the status and sent time.
-                    # The NULL reset is handled by the background thread.
+                    # Update status to 'sent' after successful dispatch
                     cursor.execute(sql.SQL("UPDATE recipients SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = %s"), [recipient_id])
                     sent_count += 1
                 else:
@@ -686,8 +653,9 @@ def send_campaign():
             except Exception as e:
                 errors.append(f'{email}: {str(e)}')
 
+        # Commit all status updates
         conn.commit()
-        print(f"--- Campaign sending finished. Committing changes. ---")
+        print(f"--- Campaign sending finished. ---")
 
         # Update the overall campaign status
         cursor.execute(sql.SQL("UPDATE campaigns SET status = 'sent' WHERE id = %s"), (campaign_id,))
@@ -705,7 +673,7 @@ def send_campaign():
 
     except Exception as e:
         print(f"Error in send_campaign: {e}")
-        if 'conn' in locals() and conn:
+        if 'conn' in locals() and conn and not conn.closed:
             conn.close()
         return jsonify({'success': False, 'error': str(e)})
 
