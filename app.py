@@ -796,30 +796,34 @@ def tracking_pixel(tracking_id):
         if conn:
             conn.close()
 
-@app.route('/click/<tracking_id>', methods=['GET'])
+@app.route('/click/<tracking_id>')
 def track_click(tracking_id):
-    """Tracking click endpoint"""
-    target_url = request.args.get('url', '/')
-    conn = None
+    """Track email clicks and redirect"""
+    conn = None # Initialize conn to None
     try:
+        original_url = request.args.get('url', BASE_URL) # Fallback to BASE_URL
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Update clicked_at and also actual_opened_at if not already set
+
         cursor.execute(sql.SQL('''
             UPDATE recipients
-            SET clicked_at = CURRENT_TIMESTAMP, status = 'clicked',
-                actual_opened_at = COALESCE(actual_opened_at, CURRENT_TIMESTAMP) -- Set actual_opened_at if NULL
+            SET clicked_at = CURRENT_TIMESTAMP
             WHERE tracking_id = %s AND clicked_at IS NULL
         '''), [tracking_id])
+
         conn.commit()
         cursor.close()
+        # conn.close() # Close conn in finally block
+
+        return redirect(original_url)
+
     except Exception as e:
         print(f"Error tracking click for {tracking_id}: {e}")
+        return redirect(BASE_URL) # Redirect to BASE_URL on error
     finally:
         if conn:
             conn.close()
-    return redirect(target_url)
-
 
 def parse_email_variations(generated_text):
     """Parse generated text into variation objects"""
