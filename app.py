@@ -1026,14 +1026,15 @@ def send_optimized_schedule():
 
     print("📩 Starting optimized send route...")
 
+    # Validate file upload
     if 'customer_csv' not in request.files:
         return jsonify({'success': False, 'error': 'CSV file not uploaded'})
 
     subject = request.form.get('subject')
     html_body = request.form.get('html_body')
 
-    print(f"✅ Received subject: {subject[:30]}...")
-    print(f"✅ HTML body length: {len(html_body)}")
+    print(f"✅ Received subject: {subject[:30] if subject else 'None'}...")
+    print(f"✅ HTML body length: {len(html_body) if html_body else 0}")
 
     if not subject or not html_body:
         return jsonify({'success': False, 'error': 'Subject and HTML body are required.'})
@@ -1044,21 +1045,31 @@ def send_optimized_schedule():
         import pandas as pd
         import datetime
         import time
+        import threading
+        import uuid
 
+        # Read and validate CSV
         df = pd.read_csv(file)
-        if 'email' not in df.columns or 'opentime' not in df.columns:
-            return jsonify({'success': False, 'error': "CSV must have 'email' and 'opentime' columns."})
+        required_columns = ['email', 'opentime']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            return jsonify({
+                'success': False, 
+                'error': f"CSV must have columns: {', '.join(required_columns)}. Missing: {', '.join(missing_columns)}"
+            })
 
-        # Define batch times
+        # Define batch times - Fixed the time format issues
         BATCH_SEND_TIMES = {
             "Morning Batch 1": (8, 0),
             "Morning Batch 2": (11, 0),
             "Evening Batch 1": (14, 0),
             "Evening Batch 2": (19, 0),
-            "Night Batch 1": (00, 30),
-            "Night Batch 2":(4, 45)
+            "Night Batch 1": (0, 30),    # Fixed: was (00, 30)
+            "Night Batch 2": (4, 45)     # Fixed: was (4, 45) - this was actually OK
         }
 
+        # Authenticate Gmail service
         service = authenticate_gmail()
         if not service:
             print("❌ Gmail authentication failed.")
@@ -1066,18 +1077,33 @@ def send_optimized_schedule():
 
         # Classify emails into batches
         batches_to_process = {batch: [] for batch in BATCH_SEND_TIMES}
-        for _, row in df.iterrows():
+        invalid_emails = []
+        
+        for index, row in df.iterrows():
             email = str(row.get('email', '')).strip()
             opentime = str(row.get('opentime', '')).strip()
 
             if not email or not opentime:
+                invalid_emails.append(f"Row {index + 2}: Missing email or opentime")
+                continue
+
+            # Validate email format (basic check)
+            if '@' not in email or '.' not in email.split('@')[-1]:
+                invalid_emails.append(f"Row {index + 2}: Invalid email format: {email}")
                 continue
 
             try:
+                # Parse the open time
                 open_time = datetime.datetime.strptime(opentime, "%H:%M").time()
             except ValueError:
-                continue
+                try:
+                    # Try alternative format
+                    open_time = datetime.datetime.strptime(opentime, "%H.%M").time()
+                except ValueError:
+                    invalid_emails.append(f"Row {index + 2}: Invalid time format: {opentime}")
+                    continue
 
+            # Classify into batches - Fixed logic to match your dataset
             if datetime.time(6, 0) <= open_time < datetime.time(10, 0):
                 batch = "Morning Batch 1"
             elif datetime.time(10, 0) <= open_time < datetime.time(12, 0):
@@ -1091,52 +1117,140 @@ def send_optimized_schedule():
             elif datetime.time(1, 0) <= open_time < datetime.time(6, 0):
                 batch = "Night Batch 2"
             else:
-                batch = "Unknown Batch"
+                invalid_emails.append(f"Row {index + 2}: Time {opentime} doesn't fit any batch")
+                continue
 
-            batches_to_process[batch].append(email)
+            batches_to_process[batch].append({
+                'email': email,
+                'opentime': opentime
+            })
 
-        # Schedule batches
+        # Log invalid entries
+        if invalid_emails:
+            print(f"⚠️  Found {len(invalid_emails)} invalid entries:")
+            for invalid in invalid_emails[:5]:  # Show first 5
+                print(f"   {invalid}")
+
+        # Prepare batch summary
+        batch_summary = []
+        total_emails = 0
+        
+        for batch, recipients in batches_to_process.items():
+            if recipients:
+                count = len(recipients)
+                batch_summary.append({
+                    'batch': batch,
+                    'count': count,
+                    'send_time': f"{BATCH_SEND_TIMES[batch][0]:02d}:{BATCH_SEND_TIMES[batch][1]:02d}"
+                })
+                total_emails += count
+
+        print(f"📊 Batch Summary: {total_emails} emails across {len(batch_summary)} batches")
+        
+        if total_emails == 0:
+            return jsonify({
+                'success': False, 
+                'error': 'No valid emails found to send',
+                'invalid_entries': invalid_emails
+            })
+
+        # Define the email sending function
+        def send_batch_emails(batch_name, recipients, send_time, subject, html_body, service):
+            """Function to send emails for a specific batch"""
+            try:
+                wait_seconds = (send_time - datetime.datetime.now()).total_seconds()
+                
+                if wait_seconds > 0:
+                    print(f"⏳ Batch '{batch_name}': Waiting {int(wait_seconds)}s until {send_time.strftime('%H:%M')}...")
+                    time.sleep(wait_seconds)
+
+                print(f"📤 Sending batch '{batch_name}' to {len(recipients)} recipients at {datetime.datetime.now().strftime('%H:%M:%S')}")
+                
+                success_count = 0
+                failure_count = 0
+                
+                for recipient in recipients:
+                    email = recipient['email']
+                    try:
+                        # Use the actual HTML body provided by user
+                        msg = create_email_message(email, subject, html_body, str(uuid.uuid4()))
+                        result = send_email_via_gmail(service, msg)
+                        
+                        if result and result.get("success"):
+                            print(f"✅ Email sent to {email}")
+                            success_count += 1
+                        else:
+                            error_msg = result.get('error', 'Unknown error') if result else 'No response'
+                            print(f"❌ Failed to send email to {email}: {error_msg}")
+                            failure_count += 1
+                            
+                    except Exception as email_error:
+                        print(f"❌ Exception sending to {email}: {str(email_error)}")
+                        failure_count += 1
+                    
+                    # Small delay between emails to avoid rate limiting
+                    time.sleep(0.1)
+                
+                print(f"✅ Batch '{batch_name}' completed: {success_count} sent, {failure_count} failed")
+                
+            except Exception as batch_error:
+                print(f"❌ Error in batch '{batch_name}': {str(batch_error)}")
+
+        # Schedule and start background threads for each batch
         now = datetime.datetime.now()
-        scheduled = []
-        sorted_batches = []
-
+        scheduled_batches = []
+        
         for batch, recipients in batches_to_process.items():
             if not recipients:
                 continue
-
+                
             h, m = BATCH_SEND_TIMES[batch]
             send_time = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if send_time < now:
+            
+            # If the time has passed today, schedule for tomorrow
+            if send_time <= now:
                 send_time += datetime.timedelta(days=1)
+            
+            # Start background thread for this batch
+            thread = threading.Thread(
+                target=send_batch_emails,
+                args=(batch, recipients, send_time, subject, html_body, service),
+                daemon=True
+            )
+            thread.start()
+            
+            scheduled_batches.append({
+                'batch': batch,
+                'count': len(recipients),
+                'scheduled_time': send_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'thread_started': True
+            })
 
-            sorted_batches.append((send_time, batch, recipients))
+        print(f"✅ All {len(scheduled_batches)} batches scheduled successfully")
+        
+        return jsonify({
+            'success': True, 
+            'message': f'Successfully scheduled {total_emails} emails across {len(scheduled_batches)} batches',
+            'scheduled_batches': scheduled_batches,
+            'batch_summary': batch_summary,
+            'invalid_entries_count': len(invalid_emails),
+            'total_emails': total_emails
+        })
 
-        sorted_batches.sort()
-
-        for send_time, batch, recipients in sorted_batches:
-            wait_seconds = (send_time - datetime.datetime.now()).total_seconds()
-            print(f"\n📤 Preparing batch '{batch}' for {len(recipients)} recipients at {send_time.strftime('%H:%M')}")
-            if wait_seconds > 0:
-                print(f"⏳ Waiting {int(wait_seconds)}s until batch '{batch}' at {send_time.strftime('%H:%M')}...")
-                time.sleep(wait_seconds)
-
-            print(f"📤 Sending batch '{batch}' to {len(recipients)} recipients.")
-            for email in recipients:
-                body = f"Hello,<br><br>This message is scheduled for <b>{batch}</b> based on your past open time preferences.<br><br>Stay tuned!<br><br>Regards,<br>Campaign Team"
-                msg = create_email_message(email, subject, html_body, str(uuid.uuid4()))
-                result = send_email_via_gmail(service, msg)
-                if result.get("success"):
-                    print(f"✅ Email sent to {email}")
-                else:
-                    print(f"❌ Failed to send email to {email}: {result.get('error')}")
-            scheduled.append((batch, len(recipients)))
-
-        print("\n✅ All batches processed.")
-        return jsonify({'success': True, 'scheduled_batches': scheduled})
-
+    except pd.errors.EmptyDataError:
+        error_msg = "CSV file is empty"
+        print(f"❌ {error_msg}")
+        return jsonify({'success': False, 'error': error_msg})
+        
+    except pd.errors.ParserError as e:
+        error_msg = f"CSV parsing error: {str(e)}"
+        print(f"❌ {error_msg}")
+        return jsonify({'success': False, 'error': error_msg})
+        
     except Exception as e:
-        print(f"❌ Error in send_optimized_schedule: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+        error_msg = f"Unexpected error: {str(e)}"
+        print(f"❌ Error in send_optimized_schedule: {error_msg}")
+        return jsonify({'success': False, 'error': error_msg})
 
 
 
