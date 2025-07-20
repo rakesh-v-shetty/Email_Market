@@ -272,25 +272,22 @@ def calculate_ab_metrics(campaign_id):
         cursor.execute(sql.SQL('''
             SELECT
                 COUNT(*) as total_sent,
-                COUNT(CASE WHEN opened_at IS NOT NULL THEN 1 END) as opened,
+                COUNT(CASE WHEN actual_opened_at IS NOT NULL THEN 1 END) as opened,
                 COUNT(CASE WHEN clicked_at IS NOT NULL THEN 1 END) as clicked,
-                COUNT(CASE WHEN converted_at IS NOT NULL THEN 1 END) as converted,
-                COUNT(CASE WHEN actual_opened_at IS NOT NULL THEN 1 END) as actual_opened_count -- New count for actual opened
+                COUNT(CASE WHEN converted_at IS NOT NULL THEN 1 END) as converted
             FROM recipients
             WHERE campaign_id = %s AND variation_assigned = %s AND status = 'sent'
         '''), [campaign_id, variation])
 
         result = cursor.fetchone()
-        total_sent, opened, clicked, converted, actual_opened_count = result # Unpack new count
+        total_sent, opened, clicked, converted = result
 
         metrics[variation] = {
             'total_sent': total_sent,
-            'opened': opened, # This is the pixel open count
+            'opened': opened,
             'clicked': clicked,
             'converted': converted,
-            'actual_opened': actual_opened_count, # Add to metrics
-            'pixel_open_rate': (opened / total_sent * 100) if total_sent > 0 else 0,
-            'actual_open_rate': (actual_opened_count / total_sent * 100) if total_sent > 0 else 0, # Use actual_opened_count
+            'open_rate': (opened / total_sent * 100) if total_sent > 0 else 0,
             'click_rate': (clicked / total_sent * 100) if total_sent > 0 else 0,
             'conversion_rate': (converted / total_sent * 100) if total_sent > 0 else 0,
             'click_through_rate': (clicked / opened * 100) if opened > 0 else 0
