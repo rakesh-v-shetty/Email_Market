@@ -18,184 +18,174 @@ import uuid
 import csv
 import io
 import re
-
-# Import psycopg2 for PostgreSQL
 import psycopg2
 from psycopg2 import sql
 from urllib.parse import urlparse
+import glob
 
-# Add dotenv support
+# Add dotenv support for local development
 try:
     from dotenv import load_dotenv
     load_dotenv()
+    print("SUCCESS: .env file loaded for local development.")
 except ImportError:
-    print('python-dotenv not installed; .env file will not be loaded automatically.')
+    print('INFO: python-dotenv not installed; .env file will not be loaded. This is normal for production.')
 
 app = Flask(__name__)
 
 # --- Configuration for Render Deployment ---
 PORT = int(os.environ.get("PORT", 5000))
-if os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
-    BASE_URL = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}"
-else:
-    BASE_URL = f"http://localhost:{PORT}"
+# The BASE_URL is taken from your Render web service's public URL.
+# Set this as an environment variable in the Render dashboard.
+BASE_URL = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
+print(f"INFO: Application will use BASE_URL: {BASE_URL}")
 
-print(f"Application will use BASE_URL: {BASE_URL}")
-
-# --- Database Configuration (PostgreSQL) ---
-# Render provides DATABASE_URL for PostgreSQL services
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
+# --- Supabase Database Configuration (Explicit & Robust) ---
+# Set these as individual environment variables in your Render dashboard
+DB_HOST = os.environ.get("DB_HOST")
+DB_NAME = os.environ.get("DB_NAME")
+DB_USER = os.environ.get("DB_USER")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+DB_PORT = os.environ.get("DB_PORT")
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
-def get_db_connection():
-    if not DATABASE_URL:
-        # For local development, if you want to use a local PostgreSQL without Render's DATABASE_URL:
-        # You would replace this with your local PostgreSQL connection details
-        print("DATABASE_URL environment variable not set. Please set it for production deployment.")
-        # As a fallback for local testing without setting DATABASE_URL, you could provide static credentials
-        # Or, raise an error to force setting the variable.
-        raise ValueError("DATABASE_URL environment variable is not set. Cannot connect to PostgreSQL.")
-
-    # Parse the DATABASE_URL provided by Render (e.g., postgresql://user:password@host:port/database)
-    result = urlparse(DATABASE_URL)
-    username = result.username
-    password = result.password
-    database = result.path[1:]
-    hostname = result.hostname
-    port = result.port
-
-    conn = psycopg2.connect(
-        host = hostname,
-        port = port,
-        database = database,
-        user = username,
-        password = password,
-        sslmode='require' # Add this for Render PostgreSQL connections
-    )
-    return conn
-
-# Database initialization (PostgreSQL specific SQL)
-def init_db():
-    """Initialize PostgreSQL database for A/B testing tracking"""
-    conn = None # Initialize conn to None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Campaigns table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS campaigns (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                company_name TEXT NOT NULL,
-                product_name TEXT NOT NULL,
-                offer_details TEXT NOT NULL,
-                campaign_type TEXT NOT NULL,
-                target_audience TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'draft',
-                total_recipients INTEGER DEFAULT 0
-            )
-        ''')
-
-        # Email variations table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS email_variations (
-                id TEXT PRIMARY KEY,
-                campaign_id TEXT NOT NULL,
-                variation_name TEXT NOT NULL,
-                subject_line TEXT NOT NULL,
-                email_body TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
-            )
-        ''')
-
-        # Recipients table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS recipients (
-                id TEXT PRIMARY KEY,
-                campaign_id TEXT NOT NULL,
-                email_address TEXT NOT NULL,
-                first_name TEXT,
-                last_name TEXT,
-                variation_assigned TEXT NOT NULL,
-                sent_at TIMESTAMP,
-                opened_at TIMESTAMP,
-                clicked_at TIMESTAMP,
-                converted_at TIMESTAMP,
-                status TEXT DEFAULT 'pending',
-                tracking_id TEXT UNIQUE,
-                FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
-            )
-        ''')
-
-        # A/B test results table (Note: PostgreSQL uses SERIAL for auto-incrementing integers)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ab_results (
-                id SERIAL PRIMARY KEY,
-                campaign_id TEXT NOT NULL,
-                variation_name TEXT NOT NULL,
-                metric_name TEXT NOT NULL,
-                metric_value REAL NOT NULL,
-                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
-            )
-        ''')
-
-        conn.commit()
-        cursor.close()
-        print("PostgreSQL database tables checked/created successfully!")
-    except Exception as e:
-        print(f"Error initializing PostgreSQL database: {e}")
-        # Depending on criticality, you might want to exit or raise the exception.
-        # For a web app, a failed DB init usually means the app can't function.
-        raise # Re-raise the exception so Render logs it as a fatal error
-    finally:
-        if conn:
-            conn.close()
+# This will handle the SSL certificate for Supabase.
+# We will create this file on Render from an environment variable.
+SSL_CERT_PATH = "supabase_ca.crt"
 
 
-# --- Call init_db() immediately after app creation ---
-# This ensures tables are created when the app starts, regardless of how it's run (gunicorn or direct python)
-try:
-    init_db()
-except Exception as e:
-    print(f"FATAL ERROR: Failed to initialize database: {e}")
-    # In a real production app, you might want a more graceful shutdown or alert system
-    # For now, we let the exception propagate so Render knows the service failed to start.
+# --- Environment Variable File Creation ---
+# This section creates the necessary JSON and certificate files from environment variables
+# when the application starts up on Render.
 
-
-# Gmail API configuration
-SCOPES = ['https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.readonly']
-
-# Hugging Face API configuration
-LLAMA_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
-HF_API_URL = f"https://api-inference.huggingface.co/models/{LLAMA_MODEL}"
-# Fetch token from environment, provide a dummy default for local testing if not set
-HF_TOKEN = os.getenv('HUGGINGFACE_API_TOKEN', 'your_huggingface_api_token_here_if_testing_locally_without_env_var')
-
-# Ensure credentials.json and token.json are present from environment variables
-# This block should be placed at the top level of your script, after 'app = Flask(__name__)'
-# These files are transiently created on Render from env vars for the Gmail API to use.
+# Google Credentials
 if os.environ.get('GOOGLE_CREDENTIALS_JSON_B64'):
     try:
         decoded_credentials = base64.b64decode(os.environ['GOOGLE_CREDENTIALS_JSON_B64']).decode('utf-8')
         with open('credentials.json', 'w') as f:
             f.write(decoded_credentials)
-        print("credentials.json created from environment variable.")
+        print("SUCCESS: credentials.json created from environment variable.")
     except Exception as e:
-        print(f"Error decoding GOOGLE_CREDENTIALS_JSON_B64: {e}")
+        print(f"ERROR: Could not decode or write GOOGLE_CREDENTIALS_JSON_B64: {e}")
 
+# Google Token
 if os.environ.get('GOOGLE_TOKEN_JSON_B64'):
     try:
         decoded_token = base64.b64decode(os.environ['GOOGLE_TOKEN_JSON_B64']).decode('utf-8')
         with open('token.json', 'w') as f:
             f.write(decoded_token)
-        print("token.json created from environment variable.")
+        print("SUCCESS: token.json created from environment variable.")
     except Exception as e:
-        print(f"Error decoding GOOGLE_TOKEN_JSON_B64: {e}")
+        print(f"ERROR: Could not decode or write GOOGLE_TOKEN_JSON_B64: {e}")
+
+# Supabase SSL Certificate
+if os.environ.get('SUPABASE_SSL_CERT'):
+    try:
+        # The certificate is a plain string, no decoding needed.
+        with open(SSL_CERT_PATH, 'w') as f:
+            f.write(os.environ['SUPABASE_SSL_CERT'])
+        print(f"SUCCESS: {SSL_CERT_PATH} created from environment variable.")
+    except Exception as e:
+        print(f"ERROR: Could not create {SSL_CERT_PATH} from environment variable: {e}")
+
+
+def get_db_connection():
+    """
+    Establishes a robust connection to the Supabase PostgreSQL database
+    using individual connection parameters and a required SSL certificate.
+    """
+    if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT]):
+        raise ValueError("One or more database environment variables (DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT) are not set.")
+
+    if not os.path.exists(SSL_CERT_PATH):
+        raise FileNotFoundError(f"SSL certificate not found at {SSL_CERT_PATH}. Ensure the SUPABASE_SSL_CERT environment variable is set and correct.")
+
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            port=DB_PORT,
+            # This is crucial for connecting to Supabase securely
+            sslmode='require',
+            sslrootcert=SSL_CERT_PATH
+        )
+        return conn
+    except psycopg2.OperationalError as e:
+        print(f"ERROR: Could not connect to the Supabase database. Please check your connection details and firewall settings.")
+        print(f"Details: {e}")
+        raise
+
+
+def init_db():
+    """Initialize PostgreSQL database tables."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Campaigns table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS campaigns (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, company_name TEXT NOT NULL,
+                product_name TEXT NOT NULL, offer_details TEXT NOT NULL, campaign_type TEXT NOT NULL,
+                target_audience TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'draft', total_recipients INTEGER DEFAULT 0
+            )
+        ''')
+        # Email variations table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS email_variations (
+                id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, variation_name TEXT NOT NULL,
+                subject_line TEXT NOT NULL, email_body TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
+            )
+        ''')
+        # Recipients table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS recipients (
+                id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, email_address TEXT NOT NULL,
+                first_name TEXT, last_name TEXT, variation_assigned TEXT NOT NULL,
+                sent_at TIMESTAMP, opened_at TIMESTAMP, clicked_at TIMESTAMP, converted_at TIMESTAMP,
+                status TEXT DEFAULT 'pending', tracking_id TEXT UNIQUE,
+                FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
+            )
+        ''')
+        # A/B test results table (PostgreSQL uses SERIAL for auto-increment)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ab_results (
+                id SERIAL PRIMARY KEY, campaign_id TEXT NOT NULL, variation_name TEXT NOT NULL,
+                metric_name TEXT NOT NULL, metric_value REAL NOT NULL,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
+            )
+        ''')
+        conn.commit()
+        cursor.close()
+        print("SUCCESS: PostgreSQL database tables checked/created successfully!")
+    except Exception as e:
+        print(f"FATAL ERROR: Could not initialize the database. The application cannot start.")
+        print(f"Details: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+# Initialize the database when the app starts.
+# This is critical for the application to function.
+try:
+    init_db()
+except Exception:
+    # Error messages are printed within init_db(), so we just prevent the app from continuing.
+    # On Render, this will cause the deployment to fail, which is the desired behavior.
+    exit(1)
+
+
+# --- API & Model Configurations ---
+SCOPES = ['https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.readonly']
+LLAMA_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
+HF_API_URL = f"https://api-inference.huggingface.co/models/{LLAMA_MODEL}"
+HF_TOKEN = os.getenv('HUGGINGFACE_API_TOKEN')
 
 # Gmail API functions
 def authenticate_gmail():
