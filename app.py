@@ -272,7 +272,7 @@ def calculate_ab_metrics(campaign_id):
         cursor.execute(sql.SQL('''
             SELECT
                 COUNT(*) as total_sent,
-                COUNT(CASE WHEN actual_opened_at IS NOT NULL THEN 1 END) as opened,
+                COUNT(CASE WHEN opened_at IS NOT NULL THEN 1 END) as opened,
                 COUNT(CASE WHEN clicked_at IS NOT NULL THEN 1 END) as clicked,
                 COUNT(CASE WHEN converted_at IS NOT NULL THEN 1 END) as converted
             FROM recipients
