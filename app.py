@@ -1,8 +1,11 @@
 from flask import Flask, render_template, request, jsonify, redirect, Response, send_file
 import requests
+import pandas as pd
 import json
 import os
 from datetime import datetime
+import datetime
+import time
 import random
 import hashlib
 import base64
@@ -22,26 +25,28 @@ import psycopg2
 from psycopg2 import sql
 from urllib.parse import urlparse
 import glob
+import logging # Import logging for more structured output
+import traceback # Import traceback for printing full stack traces
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Add dotenv support for local development
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    print("SUCCESS: .env file loaded for local development.")
+    logging.info("SUCCESS: .env file loaded for local development.")
 except ImportError:
-    print('INFO: python-dotenv not installed; .env file will not be loaded. This is normal for production.')
+    logging.info('INFO: python-dotenv not installed; .env file will not be loaded. This is normal for production.')
 
 app = Flask(__name__)
 
 # --- Configuration for Render Deployment ---
 PORT = int(os.environ.get("PORT", 5000))
-# The BASE_URL is taken from your Render web service's public URL.
-# Set this as an environment variable in the Render dashboard.
 BASE_URL = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
-print(f"INFO: Application will use BASE_URL: {BASE_URL}")
+logging.info(f"INFO: Application will use BASE_URL: {BASE_URL}")
 
 # --- Supabase Database Configuration (Explicit & Robust) ---
-# Set these as individual environment variables in your Render dashboard
 DB_HOST = os.environ.get("DB_HOST")
 DB_NAME = os.environ.get("DB_NAME")
 DB_USER = os.environ.get("DB_USER")
@@ -49,44 +54,35 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD")
 DB_PORT = os.environ.get("DB_PORT")
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
-# This will handle the SSL certificate for Supabase.
-# We will create this file on Render from an environment variable.
 SSL_CERT_PATH = "supabase_ca.crt"
 
 
 # --- Environment Variable File Creation ---
-# This section creates the necessary JSON and certificate files from environment variables
-# when the application starts up on Render.
-
-# Google Credentials
 if os.environ.get('GOOGLE_CREDENTIALS_JSON_B64'):
     try:
         decoded_credentials = base64.b64decode(os.environ['GOOGLE_CREDENTIALS_JSON_B64']).decode('utf-8')
         with open('credentials.json', 'w') as f:
             f.write(decoded_credentials)
-        print("SUCCESS: credentials.json created from environment variable.")
+        logging.info("SUCCESS: credentials.json created from environment variable.")
     except Exception as e:
-        print(f"ERROR: Could not decode or write GOOGLE_CREDENTIALS_JSON_B64: {e}")
+        logging.error(f"ERROR: Could not decode or write GOOGLE_CREDENTIALS_JSON_B64: {e}")
 
-# Google Token
 if os.environ.get('GOOGLE_TOKEN_JSON_B64'):
     try:
         decoded_token = base64.b64decode(os.environ['GOOGLE_TOKEN_JSON_B64']).decode('utf-8')
         with open('token.json', 'w') as f:
             f.write(decoded_token)
-        print("SUCCESS: token.json created from environment variable.")
+        logging.info("SUCCESS: token.json created from environment variable.")
     except Exception as e:
-        print(f"ERROR: Could not decode or write GOOGLE_TOKEN_JSON_B64: {e}")
+        logging.error(f"ERROR: Could not decode or write GOOGLE_TOKEN_JSON_B64: {e}")
 
-# Supabase SSL Certificate
 if os.environ.get('SUPABASE_SSL_CERT'):
     try:
-        # The certificate is a plain string, no decoding needed.
         with open(SSL_CERT_PATH, 'w') as f:
             f.write(os.environ['SUPABASE_SSL_CERT'])
-        print(f"SUCCESS: {SSL_CERT_PATH} created from environment variable.")
+        logging.info(f"SUCCESS: {SSL_CERT_PATH} created from environment variable.")
     except Exception as e:
-        print(f"ERROR: Could not create {SSL_CERT_PATH} from environment variable: {e}")
+        logging.error(f"ERROR: Could not create {SSL_CERT_PATH} from environment variable: {e}")
 
 
 def get_db_connection():
@@ -95,9 +91,11 @@ def get_db_connection():
     using individual connection parameters and a required SSL certificate.
     """
     if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT]):
+        logging.error("One or more database environment variables (DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT) are not set.")
         raise ValueError("One or more database environment variables (DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT) are not set.")
 
     if not os.path.exists(SSL_CERT_PATH):
+        logging.error(f"SSL certificate not found at {SSL_CERT_PATH}. Ensure the SUPABASE_SSL_CERT environment variable is set and correct.")
         raise FileNotFoundError(f"SSL certificate not found at {SSL_CERT_PATH}. Ensure the SUPABASE_SSL_CERT environment variable is set and correct.")
 
     try:
@@ -107,16 +105,13 @@ def get_db_connection():
             user=DB_USER,
             password=DB_PASSWORD,
             port=DB_PORT,
-            # This is crucial for connecting to Supabase securely
             sslmode='require',
             sslrootcert=SSL_CERT_PATH
         )
         return conn
     except psycopg2.OperationalError as e:
-        print(f"ERROR: Could not connect to the Supabase database. Please check your connection details and firewall settings.")
-        print(f"Details: {e}")
+        logging.critical(f"ERROR: Could not connect to the Supabase database. Please check your connection details and firewall settings. Details: {e}")
         raise
-
 
 def init_db():
     """Initialize PostgreSQL database tables."""
@@ -124,7 +119,6 @@ def init_db():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Campaigns table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS campaigns (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, company_name TEXT NOT NULL,
@@ -133,7 +127,6 @@ def init_db():
                 status TEXT DEFAULT 'draft', total_recipients INTEGER DEFAULT 0
             )
         ''')
-        # Email variations table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS email_variations (
                 id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, variation_name TEXT NOT NULL,
@@ -141,7 +134,6 @@ def init_db():
                 FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
             )
         ''')
-        # Recipients table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS recipients (
                 id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, email_address TEXT NOT NULL,
@@ -151,7 +143,6 @@ def init_db():
                 FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
             )
         ''')
-        # A/B test results table (PostgreSQL uses SERIAL for auto-increment)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ab_results (
                 id SERIAL PRIMARY KEY, campaign_id TEXT NOT NULL, variation_name TEXT NOT NULL,
@@ -162,22 +153,18 @@ def init_db():
         ''')
         conn.commit()
         cursor.close()
-        print("SUCCESS: PostgreSQL database tables checked/created successfully!")
+        logging.info("SUCCESS: PostgreSQL database tables checked/created successfully!")
     except Exception as e:
-        print(f"FATAL ERROR: Could not initialize the database. The application cannot start.")
-        print(f"Details: {e}")
+        logging.critical(f"FATAL ERROR: Could not initialize the database. The application cannot start. Details: {e}")
         raise
     finally:
         if conn:
             conn.close()
 
 # Initialize the database when the app starts.
-# This is critical for the application to function.
 try:
     init_db()
 except Exception:
-    # Error messages are printed within init_db(), so we just prevent the app from continuing.
-    # On Render, this will cause the deployment to fail, which is the desired behavior.
     exit(1)
 
 
@@ -191,28 +178,35 @@ HF_TOKEN = os.getenv('HUGGINGFACE_API_TOKEN')
 def authenticate_gmail():
     """Authenticate and return Gmail service object"""
     creds = None
+    logging.info("Attempting Gmail authentication...")
+    try:
+        if os.path.exists('token.json'):
+            creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+            logging.info("Loaded credentials from token.json.")
 
-    # Load existing credentials
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-
-    # If no valid credentials, get new ones
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # You need to download credentials.json from Google Cloud Console
-            if os.path.exists('credentials.json'):
-                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-                creds = flow.run_local_server(port=0)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                logging.info("Refreshing expired Gmail credentials...")
+                creds.refresh(Request())
+                logging.info("Gmail credentials refreshed successfully.")
             else:
-                raise Exception("credentials.json file not found. Download it from Google Cloud Console or set GOOGLE_CREDENTIALS_JSON_B64.")
+                if os.path.exists('credentials.json'):
+                    logging.info("No valid Gmail token, starting new OAuth flow...")
+                    flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                    creds = flow.run_local_server(port=0)
+                    logging.info("New Gmail credentials obtained via OAuth flow.")
+                else:
+                    logging.error("credentials.json file not found. Cannot perform initial OAuth. Set GOOGLE_CREDENTIALS_JSON_B64 or ensure file exists.")
+                    raise Exception("credentials.json file not found. Download it from Google Cloud Console or set GOOGLE_CREDENTIALS_JSON_B64.")
 
-        # Save credentials for next run
         with open('token.json', 'w') as token:
             token.write(creds.to_json())
-
-    return build('gmail', 'v1', credentials=creds)
+        logging.info("Gmail token.json updated/saved.")
+        return build('gmail', 'v1', credentials=creds)
+    except Exception as e:
+        logging.error(f"CRITICAL: Gmail authentication failed: {e}")
+        traceback.print_exc() # Print full traceback for auth errors
+        raise # Re-raise to be caught by the route's try-except block
 
 def create_email_message(to_email, subject, body, tracking_id):
     """Create email message with tracking pixel"""
@@ -220,16 +214,10 @@ def create_email_message(to_email, subject, body, tracking_id):
     message['to'] = to_email
     message['subject'] = subject
 
-    # Add tracking pixel to HTML version
     tracking_pixel = f'<img src="{BASE_URL}/pixel/{tracking_id}" width="1" height="1" style="display:none;">'
-
-    # Convert plain text body to HTML and add tracking
     html_body = body.replace('\n', '<br>') + tracking_pixel
-
-    # Add click tracking to links
     html_body = add_click_tracking(html_body, tracking_id)
 
-    # Create both plain text and HTML versions
     text_part = MIMEText(body, 'plain')
     html_part = MIMEText(html_body, 'html')
 
@@ -240,31 +228,33 @@ def create_email_message(to_email, subject, body, tracking_id):
 
 def add_click_tracking(html_body, tracking_id):
     """Add click tracking to links in email body"""
-    # Find all links and replace with tracking links
     def replace_link(match):
         original_url = match.group(1)
         tracking_url = f"{BASE_URL}/click/{tracking_id}?url={original_url}"
         return f'href="{tracking_url}"'
 
-    # Replace href attributes
     html_body = re.sub(r'href="([^"]*)"', replace_link, html_body)
-
     return html_body
 
 def send_email_via_gmail(service, email_message):
     """Send email using Gmail API"""
     try:
         message = service.users().messages().send(userId="me", body=email_message).execute()
+        logging.info(f"Email sent successfully. Message ID: {message['id']}")
         return {'success': True, 'message_id': message['id']}
     except HttpError as error:
+        logging.error(f"Gmail API HttpError: {error.resp.status} - {error.content.decode()}")
         return {'success': False, 'error': str(error)}
+    except Exception as e:
+        logging.error(f"Unexpected error when sending email via Gmail: {e}")
+        traceback.print_exc()
+        return {'success': False, 'error': str(e)}
 
 def calculate_ab_metrics(campaign_id):
     """Calculate A/B testing metrics for a campaign"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Get all variations for this campaign
     cursor.execute(sql.SQL('''
         SELECT DISTINCT variation_assigned FROM recipients
         WHERE campaign_id = %s
@@ -274,7 +264,6 @@ def calculate_ab_metrics(campaign_id):
     metrics = {}
 
     for variation in variations:
-        # Calculate metrics for each variation
         cursor.execute(sql.SQL('''
             SELECT
                 COUNT(*) as total_sent,
@@ -303,7 +292,6 @@ def calculate_ab_metrics(campaign_id):
     conn.close()
     return metrics
 
-# Original email generation functions (keeping existing code)
 def query_huggingface(payload):
     """Query the Hugging Face API using Llama 3 8B"""
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
@@ -314,17 +302,23 @@ def query_huggingface(payload):
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 503:
+            logging.warning("Hugging Face API: Model is loading. Please wait and try again.")
             return {"error": "Model is loading. Please wait and try again."}
         elif response.status_code == 404:
+            logging.error("Hugging Face API: Model not accessible. Check API token permissions.")
             return {"error": "Model not accessible. Check API token permissions."}
         elif response.status_code == 429:
+            logging.warning("Hugging Face API: Rate limit exceeded. Please wait before trying again.")
             return {"error": "Rate limit exceeded. Please wait before trying again."}
         else:
+            logging.error(f"Hugging Face API request failed with status {response.status_code}: {response.text}")
             return {"error": f"API request failed with status {response.status_code}"}
 
     except requests.exceptions.Timeout:
+        logging.error("Hugging Face API: Request timed out.")
         return {"error": "Request timed out. Please try again."}
     except requests.exceptions.RequestException as e:
+        logging.error(f"Hugging Face API: Request failed: {str(e)}")
         return {"error": f"Request failed: {str(e)}"}
 
 def generate_email_variations(company_name, product_name, offer_details, campaign_type, target_audience=""):
@@ -378,14 +372,14 @@ BODY: [email content]
     result = query_huggingface(payload)
 
     if 'error' in result:
-        print(f"Hugging Face API Error: {result['error']}. Generating fallback variations.")
+        logging.warning(f"Hugging Face API Error: {result['error']}. Generating fallback variations.")
         return create_fallback_variations(company_name, product_name, offer_details, campaign_type)
 
     return result
 
 def create_fallback_variations(company_name, product_name, offer_details, campaign_type):
     """Create fallback variations optimized for A/B testing"""
-
+    logging.info("Creating fallback email variations.")
     variation_a = {
         'subject': f'🚀 {product_name} - Limited Time',
         'body': f'''Hi there,
@@ -451,13 +445,13 @@ def create_campaign():
     """Create a new A/B testing campaign"""
     try:
         data = request.get_json()
+        logging.info(f"Received data for create_campaign: {data}")
 
-        # Validate required fields
         required_fields = ['company_name', 'product_name', 'offer_details', 'campaign_type']
         if not all(field in data and data[field].strip() for field in required_fields):
+            logging.warning("Missing required fields for create_campaign.")
             return jsonify({'success': False, 'error': 'Missing required fields'})
 
-        # Generate email variations
         result = generate_email_variations(
             data['company_name'], data['product_name'],
             data['offer_details'], data['campaign_type'],
@@ -465,12 +459,12 @@ def create_campaign():
         )
 
         if 'error' in result:
+            logging.error(f"Error generating email variations: {result['error']}")
             return jsonify({'success': False, 'error': result['error']})
 
-        # Parse variations
         variations = parse_email_variations(result[0]['generated_text'])
+        logging.info(f"Parsed {len(variations)} email variations.")
 
-        # Create campaign in database
         conn = get_db_connection()
         cursor = conn.cursor()
 
@@ -487,8 +481,8 @@ def create_campaign():
             data['campaign_type'],
             data.get('target_audience', '')
         ))
+        logging.info(f"Campaign {campaign_id} created in DB.")
 
-        # Save variations
         for i, variation in enumerate(variations):
             variation_id = str(uuid.uuid4())
             cursor.execute(sql.SQL('''
@@ -498,10 +492,12 @@ def create_campaign():
                 variation_id, campaign_id, f"Variation_{chr(65+i)}",
                 variation['subject'], variation['body']
             ))
+            logging.info(f"Variation {f'Variation_{chr(65+i)}'} saved for campaign {campaign_id}.")
 
         conn.commit()
         cursor.close()
         conn.close()
+        logging.info(f"Campaign {campaign_id} and variations committed to DB.")
 
         return jsonify({
             'success': True,
@@ -510,7 +506,8 @@ def create_campaign():
         })
 
     except Exception as e:
-        print(f"Error in create_campaign: {e}")
+        logging.error(f"Error in create_campaign: {e}")
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/upload-recipients', methods=['POST'])
@@ -519,20 +516,22 @@ def upload_recipients():
     try:
         campaign_id = request.form.get('campaign_id')
         if not campaign_id:
+            logging.warning("Campaign ID missing for upload_recipients.")
             return jsonify({'success': False, 'error': 'Campaign ID required'})
 
         if 'file' not in request.files:
+            logging.warning("No file uploaded for upload_recipients.")
             return jsonify({'success': False, 'error': 'No file uploaded'})
 
         file = request.files['file']
         if file.filename == '':
+            logging.warning("Empty filename for upload_recipients.")
             return jsonify({'success': False, 'error': 'No file selected'})
 
-        # Read CSV file
         stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
-        csv_input = list(csv.DictReader(stream)) # Read all recipients into a list first
+        csv_input = list(csv.DictReader(stream))
+        logging.info(f"Read {len(csv_input)} rows from recipient CSV.")
 
-        # Get campaign variations
         conn = get_db_connection()
         cursor = conn.cursor()
 
@@ -540,17 +539,17 @@ def upload_recipients():
         variations = [{'variation_name': row[0]} for row in cursor.fetchall()]
 
         if not variations:
+            logging.error(f"No variations found for campaign {campaign_id}. Cannot assign recipients.")
             return jsonify({'success': False, 'error': 'No variations found for this campaign. Cannot assign recipients.'})
 
         recipients_added = 0
         
-        # --- MODIFIED LOGIC: Round-Robin Assignment ---
         for i, row in enumerate(csv_input):
             email = row.get('email', '').strip()
             if not email:
+                logging.warning(f"Skipping row {i}: Email address missing.")
                 continue
 
-            # Assign variation by cycling through the variations list
             variation_index = i % len(variations)
             assigned_variation = variations[variation_index]['variation_name']
             
@@ -565,13 +564,13 @@ def upload_recipients():
                 assigned_variation, tracking_id
             ))
             recipients_added += 1
+        logging.info(f"Added {recipients_added} recipients to DB for campaign {campaign_id}.")
 
-        # Update campaign total recipients
         cursor.execute(sql.SQL('UPDATE campaigns SET total_recipients = %s WHERE id = %s'), (recipients_added, campaign_id))
-
         conn.commit()
         cursor.close()
         conn.close()
+        logging.info(f"Updated total recipients for campaign {campaign_id} and committed changes.")
 
         return jsonify({
             'success': True,
@@ -580,7 +579,8 @@ def upload_recipients():
         })
 
     except Exception as e:
-        print(f"Error in upload_recipients: {e}")
+        logging.error(f"Error in upload_recipients: {e}")
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/send-campaign', methods=['POST'])
@@ -590,57 +590,58 @@ def send_campaign():
         data = request.get_json()
         campaign_id = data.get('campaign_id')
         if not campaign_id:
+            logging.warning("Campaign ID required for send_campaign.")
             return jsonify({'success': False, 'error': 'Campaign ID required'})
 
-        # Authenticate Gmail
         try:
             gmail_service = authenticate_gmail()
         except Exception as e:
+            logging.critical(f"Gmail authentication failed in send_campaign route: {e}")
             return jsonify({'success': False, 'error': f'Gmail authentication failed: {str(e)}'})
 
-        # Get campaign and variations
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Get email variations
         cursor.execute(sql.SQL('''
             SELECT variation_name, subject_line, email_body FROM email_variations WHERE campaign_id = %s
         '''), [campaign_id])
         variations = {row[0]: {'subject': row[1], 'body': row[2]} for row in cursor.fetchall()}
+        logging.info(f"Found {len(variations)} variations for campaign {campaign_id}.")
 
-        # Get recipients
         cursor.execute(sql.SQL('''
             SELECT id, email_address, first_name, variation_assigned, tracking_id FROM recipients WHERE campaign_id = %s AND status = 'pending'
         '''), [campaign_id])
         recipients = cursor.fetchall()
+        logging.info(f"--- Starting to send campaign {campaign_id} to {len(recipients)} recipients ---")
 
         sent_count = 0
         errors = []
-        print(f"--- Starting to send campaign {campaign_id} to {len(recipients)} recipients ---")
 
         for recipient_id, email, first_name, variation, tracking_id in recipients:
-            print(f"\nProcessing recipient: {email} for variation: {variation}")
+            logging.info(f"Processing recipient: {email} for variation: {variation}")
             try:
-                # Get variation content
-                variation_content = variations[variation]
+                variation_content = variations.get(variation)
+                if not variation_content:
+                    error_msg = f"Variation '{variation}' not found for email {email}. Skipping."
+                    logging.error(error_msg)
+                    errors.append(f'{email}: {error_msg}')
+                    cursor.execute(sql.SQL("UPDATE recipients SET status = 'failed' WHERE id = %s"), [recipient_id])
+                    continue
 
-                # Personalize content
                 subject = variation_content['subject']
                 body = variation_content['body']
                 if first_name:
                     body = body.replace('Hi there', f'Hi {first_name}')
                     body = body.replace('Hello!', f'Hello {first_name}!')
 
-                # Create and send email
-                print(f" > Creating email message for {email}...")
+                logging.info(f" > Creating email message for {email}...")
                 email_message = create_email_message(email, subject, body, tracking_id)
 
-                print(f" > Attempting to send via Gmail API...")
+                logging.info(f" > Attempting to send via Gmail API to {email}...")
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
-                    print(f" > SUCCESS: Email sent. Updating status to 'sent'.")
-                    # Update recipient status and explicitly set tracking timestamps to NULL for new tracking
+                    logging.info(f" > SUCCESS: Email sent to {email}. Updating status to 'sent'.")
                     cursor.execute(sql.SQL('''
                         UPDATE recipients
                         SET status = 'sent', sent_at = CURRENT_TIMESTAMP, opened_at = NULL, clicked_at = NULL, converted_at = NULL
@@ -648,20 +649,23 @@ def send_campaign():
                     '''), [recipient_id])
                     sent_count += 1
                 else:
-                    print(f" > FAILED: Gmail API returned an error: {result['error']}")
+                    logging.error(f" > FAILED: Gmail API returned an error for {email}: {result['error']}")
                     errors.append(f'{email}: {result["error"]}')
                     cursor.execute(sql.SQL('''
                         UPDATE recipients SET status = 'failed' WHERE id = %s
                     '''), [recipient_id])
             except Exception as e:
-                print(f" > FAILED: An exception occurred: {str(e)}")
+                logging.error(f" > FAILED: An exception occurred processing email for {email}: {str(e)}")
+                traceback.print_exc()
                 errors.append(f'{email}: {str(e)}')
+                # Ensure status is updated even on unexpected errors
+                cursor.execute(sql.SQL('''
+                    UPDATE recipients SET status = 'failed' WHERE id = %s
+                '''), [recipient_id])
 
-        # Commit all the database changes at the end of the loop
         conn.commit()
-        print(f"--- Campaign sending finished. Committing changes to database. ---")
+        logging.info(f"--- Campaign sending finished for {campaign_id}. Committing changes to database. ---")
 
-        # Update campaign status and total recipients (if not already handled by upload)
         cursor.execute(sql.SQL("UPDATE campaigns SET status = %s WHERE id = %s"), ('sent', campaign_id))
         conn.commit()
 
@@ -681,12 +685,14 @@ def send_campaign():
             })
 
     except Exception as e:
-        print(f"Error in send_campaign: {e}")
+        logging.error(f"Error in send_campaign: {e}")
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/campaign-results/<campaign_id>')
 def campaign_results(campaign_id):
     """Get A/B testing results for a campaign"""
-    conn = None # Initialize conn to None
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -695,12 +701,12 @@ def campaign_results(campaign_id):
         campaign = cursor.fetchone()
 
         cursor.close()
-        # conn.close() # Close conn in finally block
 
         if not campaign:
+            logging.warning(f"Campaign {campaign_id} not found for results.")
             return jsonify({'success': False, 'error': 'Campaign not found'})
 
-        metrics = calculate_ab_metrics(campaign_id) # This function gets its own connection
+        metrics = calculate_ab_metrics(campaign_id)
 
         return jsonify({
             'success': True,
@@ -713,7 +719,8 @@ def campaign_results(campaign_id):
         })
 
     except Exception as e:
-        print(f"Error in campaign_results: {e}")
+        logging.error(f"Error in campaign_results for {campaign_id}: {e}")
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
     finally:
         if conn:
@@ -722,7 +729,7 @@ def campaign_results(campaign_id):
 @app.route('/campaigns')
 def list_campaigns():
     """List all campaigns"""
-    conn = None # Initialize conn to None
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -740,12 +747,12 @@ def list_campaigns():
         ]
 
         cursor.close()
-        # conn.close() # Close conn in finally block
 
         return jsonify({'success': True, 'campaigns': campaigns})
 
     except Exception as e:
-        print(f"Error in list_campaigns: {e}")
+        logging.error(f"Error in list_campaigns: {e}")
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
     finally:
         if conn:
@@ -756,7 +763,7 @@ def list_campaigns():
 @app.route('/pixel/<tracking_id>')
 def tracking_pixel(tracking_id):
     """Track email opens"""
-    conn = None # Initialize conn to None
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -769,15 +776,14 @@ def tracking_pixel(tracking_id):
 
         conn.commit()
         cursor.close()
-        # conn.close() # Close conn in finally block
+        logging.info(f"Tracking pixel hit for {tracking_id}. Open recorded.")
 
-        # Return 1x1 transparent pixel
-        pixel = base64.b64decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7')
+        pixel = base64.b64decode('R0lGODlhAQABAIAAAAAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7')
         return Response(pixel, mimetype='image/gif')
 
     except Exception as e:
-        print(f"Error tracking pixel for {tracking_id}: {e}")
-        # Return pixel even if tracking fails, to not break email client display
+        logging.error(f"Error tracking pixel for {tracking_id}: {e}")
+        traceback.print_exc()
         pixel = base64.b64decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7')
         return Response(pixel, mimetype='image/gif')
     finally:
@@ -787,9 +793,9 @@ def tracking_pixel(tracking_id):
 @app.route('/click/<tracking_id>')
 def track_click(tracking_id):
     """Track email clicks and redirect"""
-    conn = None # Initialize conn to None
+    conn = None
     try:
-        original_url = request.args.get('url', BASE_URL) # Fallback to BASE_URL
+        original_url = request.args.get('url', BASE_URL)
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -802,13 +808,14 @@ def track_click(tracking_id):
 
         conn.commit()
         cursor.close()
-        # conn.close() # Close conn in finally block
+        logging.info(f"Tracking click hit for {tracking_id}. Click recorded. Redirecting to {original_url}")
 
         return redirect(original_url)
 
     except Exception as e:
-        print(f"Error tracking click for {tracking_id}: {e}")
-        return redirect(BASE_URL) # Redirect to BASE_URL on error
+        logging.error(f"Error tracking click for {tracking_id}: {e}")
+        traceback.print_exc()
+        return redirect(BASE_URL)
     finally:
         if conn:
             conn.close()
@@ -817,12 +824,11 @@ def parse_email_variations(generated_text):
     """Parse generated text into variation objects"""
     variations = []
 
-    # Split by VARIATION markers
     parts = generated_text.split('VARIATION')
 
     for i, part in enumerate(parts[1:], 1):
         if i > 2:
-            break # Only take first two variations
+            break
 
         lines = part.strip().split('\n')
         subject = ""
@@ -835,10 +841,10 @@ def parse_email_variations(generated_text):
                 subject = line[8:].strip()
             elif line.upper().startswith('BODY:'):
                 body_started = True
-            elif body_started: # Any non-empty line after BODY: is part of the body
+            elif body_started:
                 body_lines.append(line)
 
-        body = '\n'.join(body_lines).strip() # .strip() removes leading/trailing whitespace
+        body = '\n'.join(body_lines).strip()
 
         if subject and body:
             variations.append({
@@ -846,9 +852,8 @@ def parse_email_variations(generated_text):
                 'body': body
             })
 
-    # Fallback if parsing fails or less than 2 variations are generated
     if len(variations) < 2:
-        print("Warning: Less than two variations parsed. Using fallback variations.")
+        logging.warning("Less than two variations parsed from AI response. Using fallback variations.")
         variations = [
             {
                 'subject': 'Exclusive Offer Inside 🎯',
@@ -863,20 +868,25 @@ def parse_email_variations(generated_text):
     return variations
 
 # --- Finalize Mails Endpoints ---
-import glob
-
 @app.route('/list-template-categories')
 def list_template_categories():
     base_dir = os.path.join(os.getcwd(), 'html_templates')
-    categories = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    categories = []
+    if os.path.exists(base_dir) and os.path.isdir(base_dir):
+        categories = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+        logging.info(f"Found template categories: {categories}")
+    else:
+        logging.warning(f"HTML templates base directory not found: {base_dir}")
     return jsonify({'success': True, 'categories': categories})
 
 @app.route('/list-template-files/<category>')
 def list_template_files(category):
     base_dir = os.path.join(os.getcwd(), 'html_templates', category)
     if not os.path.exists(base_dir):
+        logging.warning(f"Template category directory not found: {base_dir}")
         return jsonify({'success': False, 'error': 'Category not found'})
     files = [f for f in os.listdir(base_dir) if f.endswith('.html')]
+    logging.info(f"Found template files for category '{category}': {files}")
     return jsonify({'success': True, 'files': files})
 
 @app.route('/get-template-content/<category>/<filename>')
@@ -884,20 +894,31 @@ def get_template_content(category, filename):
     base_dir = os.path.join(os.getcwd(), 'html_templates', category)
     file_path = os.path.join(base_dir, filename)
     if not os.path.exists(file_path):
+        logging.warning(f"Template file not found: {file_path}")
         return jsonify({'success': False, 'error': 'Template not found'})
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
+    logging.info(f"Loaded content for template: {filename} in category {category}")
     return jsonify({'success': True, 'content': content})
 
 @app.route('/get-campaign-variants/<campaign_id>')
 def get_campaign_variants(campaign_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(sql.SQL('SELECT variation_name, subject_line, email_body FROM email_variations WHERE campaign_id = %s'), [campaign_id])
-    variants = [{'name': row[0], 'subject': row[1], 'body': row[2]} for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return jsonify({'success': True, 'variants': variants})
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql.SQL('SELECT variation_name, subject_line, email_body FROM email_variations WHERE campaign_id = %s'), [campaign_id])
+        variants = [{'name': row[0], 'subject': row[1], 'body': row[2]} for row in cursor.fetchall()]
+        cursor.close()
+        logging.info(f"Retrieved {len(variants)} variants for campaign {campaign_id}.")
+        return jsonify({'success': True, 'variants': variants})
+    except Exception as e:
+        logging.error(f"Error in get_campaign_variants for {campaign_id}: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)})
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route('/integrate-content-template', methods=['POST'])
@@ -907,10 +928,12 @@ def integrate_content_template():
     template_html = data.get('template_html')
 
     if not content or not template_html:
+        logging.warning("Missing content or template_html for integrate_content_template.")
         return jsonify({'success': False, 'error': 'Missing content or template_html'})
 
     groq_api_key = os.getenv('GROQ_API_KEY')
     if not groq_api_key:
+        logging.error("GROQ_API_KEY not set in environment for integrate_content_template.")
         return jsonify({'success': False, 'error': 'GROQ_API_KEY not set in environment'})
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -940,25 +963,25 @@ TEMPLATE_HTML:
     }
 
     try:
-        print("Payload sent to Groq:")
-        print(json.dumps(payload, indent=2))
+        logging.info("Sending payload to Groq API...")
+        # logging.debug(f"Payload sent to Groq: {json.dumps(payload, indent=2)}") # Uncomment for verbose payload logging
 
         response = requests.post(url, headers=headers, json=payload)
-        print("Raw Groq response:")
-        print(response.text)
+        # logging.debug(f"Raw Groq response: {response.text}") # Uncomment for verbose raw response logging
+
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
 
         result = response.json()
         raw_html = result['choices'][0]['message']['content']
+        logging.info("Received response from Groq API.")
 
-
-
-# Step 1: Remove markdown-style HTML block markers
+        # Step 1: Remove markdown-style HTML block markers
         if "```html" in raw_html:
             raw_html = raw_html.split("```html", 1)[-1]
         if "```" in raw_html:
             raw_html = raw_html.split("```", 1)[0]
 
-# Step 2: Strip typical AI wrap-up lines
+        # Step 2: Strip typical AI wrap-up lines
         wrapup_phrases = [
         "Let me know if you need any further assistance",
         "Let me know if you need anything else",
@@ -970,88 +993,59 @@ TEMPLATE_HTML:
             if phrase.lower() in raw_html.lower():
                 raw_html = raw_html[:raw_html.lower().find(phrase.lower())].strip()
 
-# Step 3: Remove "Here is..." intro text
+        # Step 3: Remove "Here is..." intro text
         raw_html = raw_html.strip()
         if raw_html.lower().startswith("here is"):
             raw_html = raw_html[raw_html.find("<"):]
-
-# Inline CSS
+        
+        # Inline CSS
         finalized_html = transform(raw_html)
-
+        logging.info("Groq response parsed and HTML transformed.")
 
         return jsonify({'success': True, 'finalized_html': finalized_html})
 
+    except requests.exceptions.RequestException as req_e:
+        logging.error(f"Request error with Groq API: {req_e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': f'Groq API request failed: {str(req_e)}'})
     except Exception as e:
-        print(f"Error parsing Groq response: {e}")
-        return jsonify({'success': False, 'error': f'Parsing error: {str(e)}'})
-
-
-"""@app.route('/send-finalized-mail', methods=['POST'])
-def send_finalized_mail():
-    # Expects: subject, html_body, sender_csv (file upload)
-    subject = request.form.get('subject')
-    html_body = request.form.get('html_body')
-    if 'sender_csv' not in request.files:
-        return jsonify({'success': False, 'error': 'No CSV file uploaded'})
-    file = request.files['sender_csv']
-    if file.filename == '':
-        return jsonify({'success': False, 'error': 'No file selected'})
-    stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
-    csv_input = csv.DictReader(stream)
-    # Use Gmail API to send emails (reuse authenticate_gmail and create_email_message)
-    service = authenticate_gmail()
-    sent_count = 0
-    for row in csv_input:
-        to_email = row.get('email', '').strip()
-        if not to_email:
-            continue
-        msg = create_email_message(to_email, subject, html_body, tracking_id=str(uuid.uuid4()))
-        result = send_email_via_gmail(service, msg)
-        if result.get('success'):
-            sent_count += 1
-    return jsonify({'success': True, 'sent_count': sent_count})"""
+        logging.error(f"Error parsing Groq response or transforming HTML: {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': f'Processing error: {str(e)}'})
 
 @app.route('/send-optimized-schedule', methods=['POST'])
 def send_optimized_schedule():
     """Send finalized emails to customers based on open-time batches"""
     
-    print("📩 Starting optimized send route...")
+    logging.info("📩 Starting optimized send route...")
     
     try:
-        # Validate file upload
         if 'customer_csv' not in request.files:
-            print("❌ No CSV file uploaded")
+            logging.error("❌ No CSV file uploaded in request.files.")
             return jsonify({'success': False, 'error': 'CSV file not uploaded'})
 
         file = request.files['customer_csv']
         if file.filename == '':
-            print("❌ Empty filename")
+            logging.error("❌ Empty filename received for customer_csv.")
             return jsonify({'success': False, 'error': 'No file selected'})
 
         subject = request.form.get('subject', '').strip()
         html_body = request.form.get('html_body', '').strip()
 
-        print(f"✅ Subject: {subject[:50] if subject else 'None'}...")
-        print(f"✅ HTML body length: {len(html_body) if html_body else 0}")
+        logging.info(f"✅ Subject: {subject[:50] if subject else 'None'}...")
+        logging.info(f"✅ HTML body length: {len(html_body) if html_body else 0}")
 
         if not subject:
+            logging.error("❌ Subject is required for optimized send.")
             return jsonify({'success': False, 'error': 'Subject is required'})
         if not html_body:
+            logging.error("❌ HTML body is required for optimized send.")
             return jsonify({'success': False, 'error': 'HTML body is required'})
 
-        # Import required libraries
-        import pandas as pd
-        import datetime
-        import uuid
-        import io
-
-        # Read CSV with better error handling
         try:
-            # Read file content
             file_content = file.read()
-            file.seek(0)  # Reset file pointer
+            file.seek(0)
             
-            # Try different encodings
             encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252']
             df = None
             
@@ -1059,22 +1053,23 @@ def send_optimized_schedule():
                 try:
                     file_string = file_content.decode(encoding)
                     df = pd.read_csv(io.StringIO(file_string))
-                    print(f"✅ CSV loaded successfully with encoding: {encoding}")
+                    logging.info(f"✅ CSV loaded successfully with encoding: {encoding}")
                     break
-                except (UnicodeDecodeError, pd.errors.ParserError):
+                except (UnicodeDecodeError, pd.errors.ParserError) as decode_error:
+                    logging.debug(f"Attempting decode with {encoding} failed: {decode_error}")
                     continue
             
             if df is None:
+                logging.error('❌ Could not read CSV file after trying multiple encodings.')
                 return jsonify({'success': False, 'error': 'Could not read CSV file. Please check file encoding.'})
                 
         except Exception as csv_error:
-            print(f"❌ CSV Error: {csv_error}")
+            logging.error(f"❌ Critical CSV reading error: {csv_error}")
+            traceback.print_exc()
             return jsonify({'success': False, 'error': f'CSV reading error: {str(csv_error)}'})
 
-        # Validate CSV structure
-        print(f"📊 CSV Info: {len(df)} rows, columns: {list(df.columns)}")
+        logging.info(f"📊 CSV Info: {len(df)} rows, columns: {list(df.columns)}")
         
-        # Check for required columns (case-insensitive)
         df_columns_lower = [col.lower().strip() for col in df.columns]
         email_col = None
         opentime_col = None
@@ -1086,44 +1081,43 @@ def send_optimized_schedule():
                 opentime_col = df.columns[i]
         
         if not email_col or not opentime_col:
+            logging.error(f"❌ Required columns not found. Found: {list(df.columns)}. Need: email, opentime (case-insensitive, space-agnostic).")
             return jsonify({
                 'success': False, 
                 'error': f'Required columns not found. Found: {list(df.columns)}. Need: email, opentime'
             })
 
-        print(f"✅ Using columns: email='{email_col}', opentime='{opentime_col}'")
+        logging.info(f"✅ Using columns: email='{email_col}', opentime='{opentime_col}'")
 
-        # Clean the data
         df = df.dropna(subset=[email_col, opentime_col])
         df[email_col] = df[email_col].astype(str).str.strip()
         df[opentime_col] = df[opentime_col].astype(str).str.strip()
         
-        # Remove empty rows
         df = df[(df[email_col] != '') & (df[opentime_col] != '')]
         
-        print(f"📊 After cleaning: {len(df)} valid rows")
+        logging.info(f"📊 After cleaning: {len(df)} valid rows for processing.")
 
-        # Define batch times (simplified)
+        # Define batch times (simplified from your original to match your new logic)
         BATCH_SEND_TIMES = {
             "Morning Batch 1": (8, 0),
             "Morning Batch 2": (11, 0), 
             "Evening Batch 1": (14, 0),
             "Evening Batch 2": (19, 0),
-            "Night Batch": (23, 0)  # Simplified to match your data
+            "Night Batch": (23, 0) # Consolidated Night Batch
         }
 
-        # Test Gmail authentication early
         try:
             service = authenticate_gmail()
             if not service:
-                print("❌ Gmail authentication failed")
+                # This path should ideally be caught by the raise in authenticate_gmail()
+                logging.error("❌ Gmail authentication failed - service object is None.")
                 return jsonify({'success': False, 'error': 'Gmail authentication failed'})
-            print("✅ Gmail authenticated successfully")
+            logging.info("✅ Gmail authenticated successfully.")
         except Exception as auth_error:
-            print(f"❌ Gmail auth error: {auth_error}")
+            logging.critical(f"❌ Gmail authentication error caught in route: {auth_error}")
+            traceback.print_exc()
             return jsonify({'success': False, 'error': f'Gmail authentication error: {str(auth_error)}'})
 
-        # Process emails into batches
         batches = {batch: [] for batch in BATCH_SEND_TIMES}
         processed_count = 0
         error_count = 0
@@ -1133,29 +1127,26 @@ def send_optimized_schedule():
                 email = str(row[email_col]).strip()
                 opentime_str = str(row[opentime_col]).strip()
                 
-                # Basic email validation
                 if '@' not in email or '.' not in email.split('@')[-1]:
-                    print(f"⚠️  Invalid email format: {email}")
+                    logging.warning(f"⚠️ Invalid email format: '{email}' at row {index}.")
                     error_count += 1
                     continue
                 
-                # Parse time - handle multiple formats
                 try:
-                    # Try HH:MM format first
+                    # Try HH:MM format first (e.g., "10:05")
                     if ':' in opentime_str:
                         open_time = datetime.datetime.strptime(opentime_str, "%H:%M").time()
-                    # Try H:MM format
+                    # Try HH.MM format (e.g., "10.05") - less common for time, but good to cover
                     elif '.' in opentime_str:
                         open_time = datetime.datetime.strptime(opentime_str, "%H.%M").time()
                     else:
-                        raise ValueError("Unknown time format")
+                        raise ValueError("Unknown time format for opentime.")
                         
                 except ValueError as time_error:
-                    print(f"⚠️  Invalid time format '{opentime_str}' for {email}: {time_error}")
+                    logging.warning(f"⚠️ Invalid time format '{opentime_str}' for email '{email}' at row {index}: {time_error}")
                     error_count += 1
                     continue
-                
-                # Classify into batches (simplified logic)
+                    
                 hour = open_time.hour
                 if 6 <= hour < 10:
                     batch = "Morning Batch 1"
@@ -1165,9 +1156,9 @@ def send_optimized_schedule():
                     batch = "Evening Batch 1"
                 elif 17 <= hour < 21:
                     batch = "Evening Batch 2"
-                else:  # 21-6 (night hours)
-                    batch = "Night Batch"
-                
+                else:
+                    batch = "Night Batch" # Catches 21:00-23:59 and 00:00-05:59
+                    
                 batches[batch].append({
                     'email': email,
                     'opentime': opentime_str,
@@ -1175,130 +1166,129 @@ def send_optimized_schedule():
                 })
                 processed_count += 1
                 
-            except Exception as row_error:
-                print(f"⚠️  Error processing row {index}: {row_error}")
+            except Exception as row_processing_error:
+                logging.error(f"⚠️ Error processing row {index} for email '{row.get(email_col, 'N/A')}': {row_processing_error}")
+                traceback.print_exc()
                 error_count += 1
                 continue
 
-        print(f"📊 Processing complete: {processed_count} valid, {error_count} errors")
+        logging.info(f"📊 Batch classification complete: {processed_count} valid entries, {error_count} errors/skipped.")
 
-        # Create batch summary
         batch_summary = []
-        total_emails = 0
+        total_emails_to_send = 0
         
-        for batch_name, emails in batches.items():
-            if emails:
-                count = len(emails)
-                send_hour, send_minute = BATCH_SEND_TIMES[batch_name]
+        for batch_name, emails_list in batches.items(): # Renamed 'emails' to 'emails_list' to avoid conflict with the 'emails' variable inside loop
+            if emails_list:
+                count = len(emails_list)
+                send_hour, send_minute = BATCH_SEND_TIMES.get(batch_name, (0,0)) # Use .get() with default for safety
                 batch_summary.append({
                     'batch': batch_name,
                     'count': count,
                     'send_time': f"{send_hour:02d}:{send_minute:02d}",
-                    'emails': [e['email'] for e in emails[:3]]  # Show first 3 emails
+                    'emails_preview': [e['email'] for e in emails_list[:3]] # Show first 3 emails
                 })
-                total_emails += count
+                total_emails_to_send += count
 
-        if total_emails == 0:
+        if total_emails_to_send == 0:
+            logging.warning('No valid emails found to process after classification.')
             return jsonify({
                 'success': False,
-                'error': 'No valid emails found to process',
+                'error': 'No valid emails found to process for sending. Check your CSV and time formats.',
                 'processed_count': processed_count,
                 'error_count': error_count
             })
 
-        print(f"✅ Batch summary: {len(batch_summary)} batches, {total_emails} total emails")
+        logging.info(f"✅ Batch summary generated: {len(batch_summary)} unique batches, {total_emails_to_send} total emails ready for sending.")
 
-        # Instead of threading, send emails immediately for testing
-        # You can modify this later to use background processing
-        
         all_results = []
         
-        for batch_name, emails in batches.items():
-            if not emails:
+        for batch_name, emails_to_send in batches.items(): # Renamed 'emails' to 'emails_to_send'
+            if not emails_to_send:
                 continue
                 
-            print(f"\n📤 Processing batch '{batch_name}' with {len(emails)} emails")
+            logging.info(f"\n📤 Processing batch '{batch_name}' with {len(emails_to_send)} emails.")
             batch_results = {
                 'batch': batch_name,
-                'total': len(emails),
+                'total': len(emails_to_send),
                 'sent': 0,
                 'failed': 0,
                 'errors': []
             }
             
-            # Send emails in this batch
-            for email_data in emails:
+            for email_data in emails_to_send:
                 try:
-                    email = email_data['email']
+                    email_address = email_data['email'] # Renamed from 'email' to avoid conflict
                     
-                    # Create email message
                     msg = create_email_message(
-                        to_email=email,
+                        to_email=email_address,
                         subject=subject,
-                        html_body=html_body,
-                        message_id=str(uuid.uuid4())
+                        body=html_body, # Use 'body' for plain text part, html_body for HTML part
+                        tracking_id=str(uuid.uuid4())
                     )
                     
-                    # Send email
+                    if msg is None: # Check if create_email_message returned None due to internal error
+                        logging.error(f"❌ Message creation failed for {email_address}. Skipping send.")
+                        batch_results['failed'] += 1
+                        batch_results['errors'].append(f"{email_address}: Message creation failed.")
+                        continue
+
                     result = send_email_via_gmail(service, msg)
                     
                     if result and result.get('success'):
-                        print(f"✅ Sent to {email}")
+                        logging.info(f"✅ Sent to {email_address}")
                         batch_results['sent'] += 1
                     else:
-                        error_msg = result.get('error', 'Unknown error') if result else 'No response'
-                        print(f"❌ Failed to send to {email}: {error_msg}")
+                        error_msg = result.get('error', 'Unknown error during send') if result else 'No send result'
+                        logging.error(f"❌ Failed to send to {email_address}: {error_msg}")
                         batch_results['failed'] += 1
-                        batch_results['errors'].append(f"{email}: {error_msg}")
+                        batch_results['errors'].append(f"{email_address}: {error_msg}")
                         
-                except Exception as send_error:
-                    print(f"❌ Exception sending to {email_data['email']}: {send_error}")
+                except Exception as send_loop_error:
+                    logging.error(f"❌ Exception in send loop for {email_data['email']}: {send_loop_error}")
+                    traceback.print_exc()
                     batch_results['failed'] += 1
-                    batch_results['errors'].append(f"{email_data['email']}: {str(send_error)}")
+                    batch_results['errors'].append(f"{email_data['email']}: {str(send_loop_error)}")
             
             all_results.append(batch_results)
             
-            # Small delay between batches
-            if len(emails) > 10:  # Only delay for larger batches
-                import time
-                time.sleep(1)
+            if len(emails_to_send) > 10:
+                time.sleep(1) # Small delay for larger batches
 
-        # Prepare final response
+        final_total_sent = sum(r['sent'] for r in all_results)
+        final_total_failed = sum(r['failed'] for r in all_results)
+
         success_response = {
             'success': True,
-            'message': f'Email campaign processed successfully',
+            'message': f'Email campaign processing completed. Sent {final_total_sent} emails, Failed {final_total_failed}.',
             'summary': {
-                'total_processed': processed_count,
-                'total_errors': error_count,
-                'total_sent': sum(r['sent'] for r in all_results),
-                'total_failed': sum(r['failed'] for r in all_results),
+                'total_processed_rows_from_csv': processed_count,
+                'total_csv_parse_errors_skipped': error_count,
+                'total_emails_attempted_send': total_emails_to_send,
+                'total_sent_successfully': final_total_sent,
+                'total_failed_to_send': final_total_failed,
                 'batches_processed': len([r for r in all_results if r['total'] > 0])
             },
             'batch_results': all_results,
             'batch_summary': batch_summary
         }
         
-        print("✅ Send optimized schedule completed successfully")
+        logging.info("✅ Send optimized schedule completed successfully.")
         return jsonify(success_response)
         
     except Exception as e:
-        error_msg = f"Unexpected error in send_optimized_schedule: {str(e)}"
-        print(f"❌ {error_msg}")
-        import traceback
-        traceback.print_exc()
+        error_msg = f"Critical and unexpected error in send_optimized_schedule route: {str(e)}"
+        logging.critical(f"❌ {error_msg}")
+        traceback.print_exc() # This is the most important for you to see the full error
         return jsonify({'success': False, 'error': error_msg})
 
 
-
 if __name__ == '__main__':
-    # This block will now only run when you execute 'python final.py' directly.
-    # The init_db() call for Gunicorn is moved above.
-    print("🧪 A/B Testing Email Marketing App")
-    print("✉️  Gmail API Integration Ready")
-    print("📊 Campaign Tracking Enabled")
-    print("🎯 Endpoints:")
-    print(f"   - Main: {BASE_URL}")
-    print(f"   - Dashboard: {BASE_URL}/ab-dashboard")
-    print(f"   - Campaigns: {BASE_URL}/campaigns")
+    logging.info("🧪 A/B Testing Email Marketing App Starting...")
+    logging.info("✉️ Gmail API Integration Ready")
+    logging.info("📊 Campaign Tracking Enabled")
+    logging.info("🎯 Endpoints:")
+    logging.info(f"   - Main: {BASE_URL}")
+    logging.info(f"   - Dashboard: {BASE_URL}/ab-dashboard")
+    logging.info(f"   - Campaigns: {BASE_URL}/campaigns")
 
     app.run(debug=True, host='0.0.0.0', port=PORT)
