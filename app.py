@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 import datetime
 import time
 import random
@@ -11,6 +11,7 @@ import hashlib
 import base64
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
+from datetime import datetime, timedelta
 from premailer import transform
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
