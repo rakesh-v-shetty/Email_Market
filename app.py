@@ -9,9 +9,6 @@ import time
 import random
 import hashlib
 import base64
-from apscheduler.schedulers.background import BackgroundScheduler
-import atexit
-from datetime import datetime, timedelta
 from premailer import transform
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -59,12 +56,6 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 SSL_CERT_PATH = "supabase_ca.crt"
 
-# --- APScheduler Setup ---
-# Initialize a scheduler to run tasks in the background
-scheduler = BackgroundScheduler()
-scheduler.start()
-# Ensure the scheduler shuts down cleanly when the app exits
-atexit.register(lambda: scheduler.shutdown())
 
 # --- Environment Variable File Creation ---
 if os.environ.get('GOOGLE_CREDENTIALS_JSON_B64'):
@@ -597,40 +588,10 @@ def upload_recipients():
         print(f"Error in upload_recipients: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
-def delayed_reset(campaign_id):
-    """
-    Waits for a scheduled time, then sets tracking columns to NULL for a campaign.
-    This is executed by the APScheduler.
-    """
-    with app.app_context(): # Essential for accessing app resources in the scheduled job
-        try:
-            print(f"[{campaign_id}] APScheduler job started. Connecting to database to reset columns.")
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Explicitly set tracking columns to NULL
-            cursor.execute(sql.SQL('''
-                UPDATE recipients 
-                SET opened_at = NULL, clicked_at = NULL, converted_at = NULL
-                WHERE campaign_id = %s
-            '''), [campaign_id])
-            
-            conn.commit()
-            print(f"[{campaign_id}] SUCCESS: Tracking columns have been reset to NULL by the scheduler.")
-            cursor.close()
-
-        except Exception as e:
-            print(f"[{campaign_id}] ERROR in APScheduler delayed_reset job: {e}")
-        finally:
-            if 'conn' in locals() and conn:
-                conn.close()
-
-
 @app.route('/send-campaign', methods=['POST'])
 def send_campaign():
     """
-    Sends the A/B testing campaign and schedules a reliable job to reset 
-    tracking fields after a 5-second delay.
+    Sends the A/B testing campaign and reliably resets tracking columns in a single process.
     """
     try:
         data = request.get_json()
@@ -638,28 +599,27 @@ def send_campaign():
 
         if not campaign_id:
             return jsonify({'success': False, 'error': 'Campaign ID required'})
-            
-        # --- MODIFIED LOGIC: Schedule the job with APScheduler ---
-        run_time = datetime.now() + timedelta(seconds=5)
-        scheduler.add_job(
-            func=delayed_reset,
-            trigger='date',
-            run_date=run_time,
-            args=[campaign_id],
-            id=f'reset_{campaign_id}_{uuid.uuid4()}' # Unique ID for the job
-        )
-        print(f"[{campaign_id}] Job scheduled to reset tracking columns at {run_time.strftime('%H:%M:%S')}")
-        # --- End of scheduling ---
 
-        # Authenticate Gmail and send emails as before
+        # --- DB Operation: Reliably reset all tracking columns for the campaign first ---
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        print(f"[{campaign_id}] Resetting tracking columns to NULL before sending...")
+        cursor.execute(sql.SQL('''
+            UPDATE recipients
+            SET opened_at = NULL, clicked_at = NULL, converted_at = NULL
+            WHERE campaign_id = %s
+        '''), [campaign_id])
+        conn.commit()
+        print(f"[{campaign_id}] Tracking columns successfully reset.")
+        # --- End of reset operation ---
+
+        # Authenticate Gmail
         try:
             gmail_service = authenticate_gmail()
         except Exception as e:
             return jsonify({'success': False, 'error': f'Gmail authentication failed: {str(e)}'})
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
+        # Get variations and recipients
         cursor.execute(sql.SQL('SELECT variation_name, subject_line, email_body FROM email_variations WHERE campaign_id = %s'), [campaign_id])
         variations = {row[0]: {'subject': row[1], 'body': row[2]} for row in cursor.fetchall()}
 
@@ -668,6 +628,8 @@ def send_campaign():
 
         sent_count = 0
         errors = []
+
+        print(f"--- Starting to send campaign {campaign_id} to {len(recipients)} recipients ---")
 
         for recipient_id, email, first_name, variation, tracking_id in recipients:
             try:
@@ -681,6 +643,7 @@ def send_campaign():
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
+                    # Update status to 'sent' after successful dispatch
                     cursor.execute(sql.SQL("UPDATE recipients SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = %s"), [recipient_id])
                     sent_count += 1
                 else:
@@ -690,9 +653,14 @@ def send_campaign():
             except Exception as e:
                 errors.append(f'{email}: {str(e)}')
 
+        # Commit all status updates
         conn.commit()
+        print(f"--- Campaign sending finished. ---")
+
+        # Update the overall campaign status
         cursor.execute(sql.SQL("UPDATE campaigns SET status = 'sent' WHERE id = %s"), (campaign_id,))
         conn.commit()
+
         cursor.close()
         conn.close()
 
