@@ -113,12 +113,14 @@ def get_db_connection():
         logging.critical(f"ERROR: Could not connect to the Supabase database. Please check your connection details and firewall settings. Details: {e}")
         raise
 
+# --- Database Initialization ---
 def init_db():
     """Initialize PostgreSQL database tables."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        # Create tables (no changes needed here as they are standard PostgreSQL)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS campaigns (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, company_name TEXT NOT NULL,
@@ -140,6 +142,7 @@ def init_db():
                 first_name TEXT, last_name TEXT, variation_assigned TEXT NOT NULL,
                 sent_at TIMESTAMP, opened_at TIMESTAMP, clicked_at TIMESTAMP, converted_at TIMESTAMP,
                 status TEXT DEFAULT 'pending', tracking_id TEXT UNIQUE,
+                actual_opened_at TIMESTAMP, -- NEW COLUMN ADDED HERE
                 FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
             )
         ''')
@@ -153,9 +156,9 @@ def init_db():
         ''')
         conn.commit()
         cursor.close()
-        logging.info("SUCCESS: PostgreSQL database tables checked/created successfully!")
+        print("SUCCESS: PostgreSQL database tables checked/created successfully!")
     except Exception as e:
-        logging.critical(f"FATAL ERROR: Could not initialize the database. The application cannot start. Details: {e}")
+        print(f"FATAL ERROR during database initialization: {e}")
         raise
     finally:
         if conn:
@@ -255,6 +258,7 @@ def calculate_ab_metrics(campaign_id):
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # Get all variations for this campaign
     cursor.execute(sql.SQL('''
         SELECT DISTINCT variation_assigned FROM recipients
         WHERE campaign_id = %s
@@ -264,25 +268,29 @@ def calculate_ab_metrics(campaign_id):
     metrics = {}
 
     for variation in variations:
+        # Calculate metrics for each variation
         cursor.execute(sql.SQL('''
             SELECT
                 COUNT(*) as total_sent,
                 COUNT(CASE WHEN opened_at IS NOT NULL THEN 1 END) as opened,
                 COUNT(CASE WHEN clicked_at IS NOT NULL THEN 1 END) as clicked,
-                COUNT(CASE WHEN converted_at IS NOT NULL THEN 1 END) as converted
+                COUNT(CASE WHEN converted_at IS NOT NULL THEN 1 END) as converted,
+                COUNT(CASE WHEN actual_opened_at IS NOT NULL THEN 1 END) as actual_opened_count -- New count for actual opened
             FROM recipients
             WHERE campaign_id = %s AND variation_assigned = %s AND status = 'sent'
         '''), [campaign_id, variation])
 
         result = cursor.fetchone()
-        total_sent, opened, clicked, converted = result
+        total_sent, opened, clicked, converted, actual_opened_count = result # Unpack new count
 
         metrics[variation] = {
             'total_sent': total_sent,
-            'opened': opened,
+            'opened': opened, # This is the pixel open count
             'clicked': clicked,
             'converted': converted,
-            'open_rate': (opened / total_sent * 100) if total_sent > 0 else 0,
+            'actual_opened': actual_opened_count, # Add to metrics
+            'pixel_open_rate': (opened / total_sent * 100) if total_sent > 0 else 0,
+            'actual_open_rate': (actual_opened_count / total_sent * 100) if total_sent > 0 else 0, # Use actual_opened_count
             'click_rate': (clicked / total_sent * 100) if total_sent > 0 else 0,
             'conversion_rate': (converted / total_sent * 100) if total_sent > 0 else 0,
             'click_through_rate': (clicked / opened * 100) if opened > 0 else 0
@@ -641,13 +649,14 @@ def send_campaign():
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
-                    logging.info(f" > SUCCESS: Email sent to {email}. Updating status to 'sent'.")
+                    print(f" > SUCCESS: Email sent. Updating status to 'sent'.")
                     cursor.execute(sql.SQL('''
                         UPDATE recipients
-                        SET status = 'sent', sent_at = CURRENT_TIMESTAMP, opened_at = NULL, clicked_at = NULL, converted_at = NULL
+                        SET status = 'sent', sent_at = CURRENT_TIMESTAMP, opened_at = NULL, clicked_at = NULL, converted_at = NULL, actual_opened_at = NULL
                         WHERE id = %s
                     '''), [recipient_id])
                     sent_count += 1
+                    
                 else:
                     logging.error(f" > FAILED: Gmail API returned an error for {email}: {result['error']}")
                     errors.append(f'{email}: {result["error"]}')
@@ -790,35 +799,30 @@ def tracking_pixel(tracking_id):
         if conn:
             conn.close()
 
-@app.route('/click/<tracking_id>')
+@app.route('/click/<tracking_id>', methods=['GET'])
 def track_click(tracking_id):
-    """Track email clicks and redirect"""
+    """Tracking click endpoint"""
+    target_url = request.args.get('url', '/')
     conn = None
     try:
-        original_url = request.args.get('url', BASE_URL)
-
         conn = get_db_connection()
         cursor = conn.cursor()
-
+        # Update clicked_at and also actual_opened_at if not already set
         cursor.execute(sql.SQL('''
             UPDATE recipients
-            SET clicked_at = CURRENT_TIMESTAMP
+            SET clicked_at = CURRENT_TIMESTAMP, status = 'clicked',
+                actual_opened_at = COALESCE(actual_opened_at, CURRENT_TIMESTAMP) -- Set actual_opened_at if NULL
             WHERE tracking_id = %s AND clicked_at IS NULL
         '''), [tracking_id])
-
         conn.commit()
         cursor.close()
-        logging.info(f"Tracking click hit for {tracking_id}. Click recorded. Redirecting to {original_url}")
-
-        return redirect(original_url)
-
     except Exception as e:
-        logging.error(f"Error tracking click for {tracking_id}: {e}")
-        traceback.print_exc()
-        return redirect(BASE_URL)
+        print(f"Error tracking click for {tracking_id}: {e}")
     finally:
         if conn:
             conn.close()
+    return redirect(target_url)
+
 
 def parse_email_variations(generated_text):
     """Parse generated text into variation objects"""
