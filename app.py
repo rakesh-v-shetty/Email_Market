@@ -590,28 +590,12 @@ def upload_recipients():
 
 @app.route('/send-campaign', methods=['POST'])
 def send_campaign():
-    """
-    Sends the A/B testing campaign and reliably resets tracking columns in a single process.
-    """
+    """Send A/B testing campaign"""
     try:
         data = request.get_json()
         campaign_id = data.get('campaign_id')
-
         if not campaign_id:
             return jsonify({'success': False, 'error': 'Campaign ID required'})
-
-        # --- DB Operation: Reliably reset all tracking columns for the campaign first ---
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        print(f"[{campaign_id}] Resetting tracking columns to NULL before sending...")
-        cursor.execute(sql.SQL('''
-            UPDATE recipients
-            SET opened_at = NULL, clicked_at = NULL, converted_at = NULL
-            WHERE campaign_id = %s
-        '''), [campaign_id])
-        conn.commit()
-        print(f"[{campaign_id}] Tracking columns successfully reset.")
-        # --- End of reset operation ---
 
         # Authenticate Gmail
         try:
@@ -619,62 +603,90 @@ def send_campaign():
         except Exception as e:
             return jsonify({'success': False, 'error': f'Gmail authentication failed: {str(e)}'})
 
-        # Get variations and recipients
-        cursor.execute(sql.SQL('SELECT variation_name, subject_line, email_body FROM email_variations WHERE campaign_id = %s'), [campaign_id])
+        # Get campaign and variations
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Get email variations
+        cursor.execute(sql.SQL('''
+            SELECT variation_name, subject_line, email_body FROM email_variations WHERE campaign_id = %s
+        '''), [campaign_id])
         variations = {row[0]: {'subject': row[1], 'body': row[2]} for row in cursor.fetchall()}
 
-        cursor.execute(sql.SQL("SELECT id, email_address, first_name, variation_assigned, tracking_id FROM recipients WHERE campaign_id = %s AND status = 'pending'"), [campaign_id])
+        # Get recipients
+        cursor.execute(sql.SQL('''
+            SELECT id, email_address, first_name, variation_assigned, tracking_id FROM recipients WHERE campaign_id = %s AND status = 'pending'
+        '''), [campaign_id])
         recipients = cursor.fetchall()
 
         sent_count = 0
         errors = []
-
         print(f"--- Starting to send campaign {campaign_id} to {len(recipients)} recipients ---")
 
         for recipient_id, email, first_name, variation, tracking_id in recipients:
+            print(f"\nProcessing recipient: {email} for variation: {variation}")
             try:
+                # Get variation content
                 variation_content = variations[variation]
+
+                # Personalize content
                 subject = variation_content['subject']
                 body = variation_content['body']
                 if first_name:
-                    body = body.replace('Hi there', f'Hi {first_name}').replace('Hello!', f'Hello {first_name}!')
+                    body = body.replace('Hi there', f'Hi {first_name}')
+                    body = body.replace('Hello!', f'Hello {first_name}!')
 
+                # Create and send email
+                print(f" > Creating email message for {email}...")
                 email_message = create_email_message(email, subject, body, tracking_id)
+
+                print(f" > Attempting to send via Gmail API...")
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
-                    # Update status to 'sent' after successful dispatch
-                    cursor.execute(sql.SQL("UPDATE recipients SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = %s"), [recipient_id])
+                    print(f" > SUCCESS: Email sent. Updating status to 'sent'.")
+                    # Update recipient status and explicitly set tracking timestamps to NULL for new tracking
+                    cursor.execute(sql.SQL('''
+                        UPDATE recipients
+                        SET status = 'sent', sent_at = CURRENT_TIMESTAMP, opened_at = NULL, clicked_at = NULL, converted_at = NULL
+                        WHERE id = %s
+                    '''), [recipient_id])
                     sent_count += 1
                 else:
+                    print(f" > FAILED: Gmail API returned an error: {result['error']}")
                     errors.append(f'{email}: {result["error"]}')
-                    cursor.execute(sql.SQL("UPDATE recipients SET status = 'failed' WHERE id = %s"), [recipient_id])
-
+                    cursor.execute(sql.SQL('''
+                        UPDATE recipients SET status = 'failed' WHERE id = %s
+                    '''), [recipient_id])
             except Exception as e:
+                print(f" > FAILED: An exception occurred: {str(e)}")
                 errors.append(f'{email}: {str(e)}')
 
-        # Commit all status updates
+        # Commit all the database changes at the end of the loop
         conn.commit()
-        print(f"--- Campaign sending finished. ---")
+        print(f"--- Campaign sending finished. Committing changes to database. ---")
 
-        # Update the overall campaign status
-        cursor.execute(sql.SQL("UPDATE campaigns SET status = 'sent' WHERE id = %s"), (campaign_id,))
+        # Update campaign status and total recipients (if not already handled by upload)
+        cursor.execute(sql.SQL("UPDATE campaigns SET status = %s WHERE id = %s"), ('sent', campaign_id))
         conn.commit()
 
         cursor.close()
         conn.close()
 
-        return jsonify({
-            'success': True,
-            'sent_count': sent_count,
-            'total_recipients': len(recipients),
-            'errors': errors[:10]
-        })
+        if errors:
+            return jsonify({
+                'success': False,
+                'message': f'Campaign sent with {sent_count} successes and {len(errors)} errors.',
+                'errors': errors
+            })
+        else:
+            return jsonify({
+                'success': True,
+                'message': f'Campaign sent successfully to {sent_count} recipients.'
+            })
 
     except Exception as e:
         print(f"Error in send_campaign: {e}")
-        if 'conn' in locals() and conn and not conn.closed:
-            conn.close()
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/campaign-results/<campaign_id>')
