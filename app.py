@@ -644,15 +644,16 @@ def send_campaign():
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
-                    print(f" > SUCCESS: Email sent. Waiting 5 seconds before clearing opened_at for potential pixel fire.")
+                    print(f" > SUCCESS: Email sent. Waiting 5 seconds before allowing pixel to register.")
                     # Introduce a 5-second delay here
-                    time.sleep(5)
-                    print(f" > Delay complete. Updating status to 'sent' and clearing tracking timestamps.")
+                    time.sleep(5) #
+                    print(f" > Delay complete. Updating status to 'sent' and sent_at timestamp.")
 
-                    # Update recipient status and explicitly set tracking timestamps to NULL for new tracking
+                    # Only update status and sent_at. Do NOT set opened_at to NULL here.
+                    # opened_at, clicked_at, converted_at should only be updated by their respective tracking endpoints.
                     cursor.execute(sql.SQL('''
                         UPDATE recipients
-                        SET status = 'sent', sent_at = CURRENT_TIMESTAMP, opened_at = NULL, clicked_at = NULL, converted_at = NULL
+                        SET status = 'sent', sent_at = CURRENT_TIMESTAMP
                         WHERE id = %s
                     '''), [recipient_id])
                     sent_count += 1
