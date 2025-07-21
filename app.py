@@ -465,7 +465,7 @@ def create_fallback_variations(company_name, product_name, offer_details, campai
 We are excited to introduce you to {product_name}, designed to help you with {offer_details}.
 
 Key benefits include:
-- Enhanced productivity # <--- UPDATED BODY CONTENT
+- Enhanced productivity
 - Streamlined processes
 - Reliable support
 
@@ -487,7 +487,7 @@ P.S. Explore the full features and benefits on our website.
 At {company_name}, we're always looking for ways to provide greater value. That's why we're delighted to share {product_name}, our latest innovation.
 
 This {campaign_type.lower()} is tailored to assist you with {offer_details}. Many customers are already experiencing positive results:
-"Absolutely transformed my workflow!" - A Happy User # <--- UPDATED BODY CONTENT (Added social proof)
+"Absolutely transformed my workflow!" - A Happy User
 "Simple, effective, and powerful." - Another Customer
 
 Ready to see how {product_name} can work for you?
