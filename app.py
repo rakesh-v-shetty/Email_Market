@@ -239,29 +239,6 @@ def create_email_message(to_email, subject, body, tracking_id):
 
     return {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
 
-# You'll also need to add an /unsubscribe route:
-@app.route('/unsubscribe/<tracking_id>')
-def unsubscribe(tracking_id):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(sql.SQL('''
-            UPDATE recipients
-            SET status = 'unsubscribed', converted_at = CURRENT_TIMESTAMP -- Using converted_at to mark unsubscribe time, or add a dedicated column
-            WHERE tracking_id = %s
-        '''), [tracking_id])
-        conn.commit()
-        logging.info(f"Recipient {tracking_id} unsubscribed.")
-        # Render a simple confirmation page or redirect to a success page
-        return "You have successfully unsubscribed."
-    except Exception as e:
-        logging.error(f"Error unsubscribing {tracking_id}: {e}")
-        return "An error occurred during unsubscribe."
-    finally:
-        if conn:
-            conn.close()
-
 def add_click_tracking(html_body, tracking_id):
     """Add click tracking to links in email body"""
     def replace_link(match):
