@@ -215,22 +215,54 @@ def authenticate_gmail():
         raise # Re-raise to be caught by the route's try-except block
 
 def create_email_message(to_email, subject, body, tracking_id):
-    """Create email message with tracking pixel"""
+    """Create email message with tracking pixel and unsubscribe link"""
     message = MIMEMultipart('alternative')
     message['to'] = to_email
     message['subject'] = subject
 
     tracking_pixel = f'<img src="{BASE_URL}/pixel/{tracking_id}" width="1" height="1" style="display:none;">'
-    html_body = body.replace('\n', '<br>') + tracking_pixel
-    html_body = add_click_tracking(html_body, tracking_id)
+    
+    # Add a simple unsubscribe link. You might want a dedicated unsubscribe route.
+    # For now, let's just make it a placeholder.
+    # A more robust solution would be a unique unsubscribe URL for each recipient.
+    unsubscribe_link = f'<p style="font-size:10px; color:#999999; text-align:center;">If you no longer wish to receive these emails, <a href="{BASE_URL}/unsubscribe/{tracking_id}" style="color:#999999;">unsubscribe here</a>.</p>'
 
-    text_part = MIMEText(body, 'plain')
-    html_part = MIMEText(html_body, 'html')
+    html_body = body.replace('\n', '<br>') + tracking_pixel + unsubscribe_link
+    html_body = add_click_tracking(html_body, tracking_id) # Ensure this is called AFTER adding pixel and unsubscribe link
+
+    text_part = MIMEText(body, 'plain') # The plain text part should also reflect the option to unsubscribe
+    # For plain text, you might just add a text version of the unsubscribe instruction
+    plain_text_unsubscribe = f"\n\n---\nIf you no longer wish to receive these emails, please reply to this email or visit {BASE_URL}/unsubscribe/{tracking_id} to unsubscribe."
+    text_part = MIMEText(body + plain_text_unsubscribe, 'plain')
+
 
     message.attach(text_part)
     message.attach(html_part)
 
     return {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
+
+# You'll also need to add an /unsubscribe route:
+@app.route('/unsubscribe/<tracking_id>')
+def unsubscribe(tracking_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql.SQL('''
+            UPDATE recipients
+            SET status = 'unsubscribed', converted_at = CURRENT_TIMESTAMP -- Using converted_at to mark unsubscribe time, or add a dedicated column
+            WHERE tracking_id = %s
+        '''), [tracking_id])
+        conn.commit()
+        logging.info(f"Recipient {tracking_id} unsubscribed.")
+        # Render a simple confirmation page or redirect to a success page
+        return "You have successfully unsubscribed."
+    except Exception as e:
+        logging.error(f"Error unsubscribing {tracking_id}: {e}")
+        return "An error occurred during unsubscribe."
+    finally:
+        if conn:
+            conn.close()
 
 def add_click_tracking(html_body, tracking_id):
     """Add click tracking to links in email body"""
@@ -333,7 +365,7 @@ def generate_email_variations(company_name, product_name, offer_details, campaig
     """Generate email variations using AI"""
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
-You are an expert email marketing copywriter. Create two completely different marketing email variations for A/B testing. Each should have a unique approach and tone while maintaining high conversion potential.
+You are an expert email marketing copywriter specialized in high deliverability and engagement. Create two completely different marketing email variations for A/B testing. Each should have a unique, professional, and trustworthy approach and tone, designed to pass spam filters while maintaining high conversion potential.
 
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 
@@ -345,23 +377,31 @@ Campaign Focus: {offer_details}
 Type: {campaign_type}
 Audience: {target_audience if target_audience else "General customers"}
 
-Requirements:
-- Subject line: Under 50 characters, A/B test friendly
-- Email body: Professional, persuasive, conversion-focused
-- Minimal emoji use (2-3 maximum per email)
-- Different psychological triggers for each variation
-- Clear call-to-action with trackable links
-- Optimized for mobile reading
+Requirements for each email:
+- **Subject line:** Concise (under 50 characters), compelling, and avoid all caps or excessive punctuation. Hint at value, create curiosity, or state purpose clearly.
+- **Email body:**
+    - Professional, clear, concise, and persuasive.
+    - Focus on benefits for the recipient.
+    - Use natural language; avoid overly salesy or aggressive terms.
+    - **Crucially, avoid spam trigger words and phrases (e.g., "free money", "guaranteed income", excessive urgency unless genuinely applicable and communicated professionally).**
+    - Employ different psychological triggers for each variation (e.g., scarcity, social proof, fear of missing out, value proposition, problem/solution).
+    - Clear and prominent call-to-action (CTA) with descriptive, trust-inspiring text (e.g., "Learn More about [Product Name]", "Get Your Free Guide").
+    - Optimized for mobile reading (short paragraphs, good line breaks).
+    - **Include a clear and prominent unsubscribe link.** (You'll need to add this to your `create_email_message` function)
+    - **Signature:** Professional closing with company name.
+    - Minimal emoji use (0-2 maximum per email, only if it enhances the message).
+    - Maintain a good text-to-image ratio (primarily text).
+- **Tone:** One variation could be direct and benefit-driven, the other more narrative or curiosity-driven.
 
-Format response as:
+Format response strictly as:
 
 VARIATION A:
 SUBJECT: [subject line]
-BODY: [email content]
+BODY: [email content including a placeholder for an unsubscribe link like "[Unsubscribe Here]"]
 
 VARIATION B:
 SUBJECT: [subject line]
-BODY: [email content]
+BODY: [email content including a placeholder for an unsubscribe link like "[Unsubscribe Here]"]
 
 <|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
 
@@ -386,55 +426,56 @@ BODY: [email content]
     return result
 
 def create_fallback_variations(company_name, product_name, offer_details, campaign_type):
-    """Create fallback variations optimized for A/B testing"""
-    logging.info("Creating fallback email variations.")
+    """Create fallback variations optimized for A/B testing, with better spam-filter avoidance."""
+    logging.info("Creating fallback email variations with improved content.")
+
     variation_a = {
-        'subject': f'🚀 {product_name} - Limited Time',
-        'body': f'''Hi there,
+        'subject': f'{product_name} from {company_name}: Special Invitation', # More professional
+        'body': f'''Dear Valued Customer,
 
-Big news! We've just launched {product_name} and it's already creating a buzz.
+We are excited to introduce you to {product_name}, designed to help you with {offer_details}.
 
-{offer_details}
+Key benefits include:
+- Enhanced [Benefit 1 based on product/offer]
+- Streamlined [Benefit 2 based on product/offer]
+- Reliable [Benefit 3 based on product/offer]
 
-Here's what makes this special:
-✓ Designed specifically for people like you
-✓ Proven results from our beta testing
-✓ Limited-time exclusive access
+Discover how {product_name} can make a difference for you today.
 
-Ready to be among the first to experience this?
+[Learn More About {product_name}]  # Clearer CTA
 
-[Claim Your Spot Now]
+Sincerely,
+The {company_name} Team
 
-Best,
-{company_name} Team
-
-P.S. This offer expires soon - don't miss out!'''
+P.S. Explore the full features and benefits on our website.
+'''
     }
 
     variation_b = {
-        'subject': f'You\'re invited: {product_name}',
-        'body': f'''Hello!
+        'subject': f'Unlock Your Potential with {product_name}', # Benefit-oriented
+        'body': f'''Hello,
 
-We have something exciting to share with you.
+At {company_name}, we're always looking for ways to provide greater value. That's why we're delighted to share {product_name}, our latest innovation.
 
-After months of development, {product_name} is finally here. The early feedback has been incredible, and we think you'll love what we've created.
+This {campaign_type.lower()} is tailored to assist you with {offer_details}. Many customers are already experiencing positive results:
+"Absolutely transformed my workflow!" - A Happy User
+"Simple, effective, and powerful." - Another Customer
 
-{offer_details}
+Ready to see how {product_name} can work for you?
 
-What our customers are saying:
-"This exceeded all my expectations" - Sarah M.
-"Finally, a solution that actually works" - David L.
+[Get Started with {product_name}] # Clearer CTA
 
-Want to see what all the excitement is about?
-
-[Discover More]
-
-Warmly,
+Warm regards,
 The {company_name} Team
 
-P.S. Join hundreds of satisfied customers who've already made the switch. 🌟'''
+P.S. We invite you to visit our site for a detailed overview.
+'''
     }
 
+    # Integrate the unsubscribe placeholder for the AI to fill, or add a generic one
+    # This assumes the AI *might* put it, but if not, your `create_email_message` will add one.
+    # For fallback, it's safer to have create_email_message add it reliably.
+    
     return [{"generated_text": f"VARIATION A:\nSUBJECT: {variation_a['subject']}\nBODY: {variation_a['body']}\n\nVARIATION B:\nSUBJECT: {variation_b['subject']}\nBODY: {variation_b['body']}"}]
 
 # API Routes
