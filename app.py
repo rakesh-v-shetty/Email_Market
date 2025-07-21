@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import json
 import os
+from urllib.parse import quote_plus # <--- ADD THIS IMPORT
 from datetime import datetime
 import datetime
 import time
@@ -16,6 +17,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapapi.errors import HttpError
 from googleapiclient.errors import HttpError
 import uuid
 import csv
@@ -223,18 +225,15 @@ def create_email_message(to_email, subject, body, tracking_id):
     tracking_pixel = f'<img src="{BASE_URL}/pixel/{tracking_id}" width="1" height="1" style="display:none;">'
     
     # Add a simple unsubscribe link. You might want a dedicated unsubscribe route.
-    # For now, let's just make it a placeholder.
     # A more robust solution would be a unique unsubscribe URL for each recipient.
-    unsubscribe_link = f'<p style="font-size:10px; color:#999999; text-align:center;">If you no longer wish to receive these emails, <a href="{BASE_URL}/unsubscribe/{tracking_id}" style="color:#999999;">unsubscribe here</a>.</p>'
+    unsubscribe_link_html = f'<p style="font-size:10px; color:#999999; text-align:center;">If you no longer wish to receive these emails, <a href="{BASE_URL}/unsubscribe/{tracking_id}" style="color:#999999;">unsubscribe here</a>.</p>'
+    unsubscribe_link_plain = f"\n\n---\nIf you no longer wish to receive these emails, please reply to this email or visit {BASE_URL}/unsubscribe/{tracking_id} to unsubscribe."
 
-    html_body = body.replace('\n', '<br>') + tracking_pixel + unsubscribe_link
-    html_body = add_click_tracking(html_body, tracking_id) # Ensure this is called AFTER adding pixel and unsubscribe link
+    html_body_with_tracking = body.replace('\n', '<br>') + tracking_pixel + unsubscribe_link_html
+    html_body_with_tracking = add_click_tracking(html_body_with_tracking, tracking_id)
 
-    text_part = MIMEText(body, 'plain') # The plain text part should also reflect the option to unsubscribe
-    # For plain text, you might just add a text version of the unsubscribe instruction
-    plain_text_unsubscribe = f"\n\n---\nIf you no longer wish to receive these emails, please reply to this email or visit {BASE_URL}/unsubscribe/{tracking_id} to unsubscribe."
-    text_part = MIMEText(body + plain_text_unsubscribe, 'plain')
-
+    text_part = MIMEText(body + unsubscribe_link_plain, 'plain')
+    html_part = MIMEText(html_body_with_tracking, 'html') # <--- THIS LINE WAS MISSING/INCORRECT
 
     message.attach(text_part)
     message.attach(html_part)
@@ -268,10 +267,13 @@ def add_click_tracking(html_body, tracking_id):
     """Add click tracking to links in email body"""
     def replace_link(match):
         original_url = match.group(1)
-        tracking_url = f"{BASE_URL}/click/{tracking_id}?url={original_url}"
+        # Ensure the original_url is URL-encoded if it contains query parameters etc.
+        # urllib.parse.quote_plus can be used here for robust encoding.
+        tracking_url = f"{BASE_URL}/click/{tracking_id}?url={quote_plus(original_url)}"
         return f'href="{tracking_url}"'
 
-    html_body = re.sub(r'href="([^"]*)"', replace_link, html_body)
+    # Use a non-greedy regex to prevent matching across multiple href attributes
+    html_body = re.sub(r'href="([^"]*?)"', replace_link, html_body) # <--- UPDATED REGEX
     return html_body
 
 def send_email_via_gmail(service, email_message):
@@ -361,8 +363,54 @@ def query_huggingface(payload):
         logging.error(f"Hugging Face API: Request failed: {str(e)}")
         return {"error": f"Request failed: {str(e)}"}
 
+def parse_email_variations(generated_text):
+    """Parse generated text into variation objects"""
+    variations = []
+
+    parts = generated_text.split('VARIATION')
+
+    for i, part in enumerate(parts[1:], 1):
+        if i > 2:
+            break
+
+        lines = part.strip().split('\n')
+        subject = ""
+        body_lines = []
+        body_started = False
+
+        for line in lines:
+            line = line.strip()
+            if line.upper().startswith('SUBJECT:'):
+                subject = line[8:].strip()
+            elif line.upper().startswith('BODY:'):
+                body_started = True
+            elif body_started:
+                body_lines.append(line)
+
+        body = '\n'.join(body_lines).strip()
+
+        if subject and body:
+            variations.append({
+                'subject': subject,
+                'body': body
+            })
+
+    if len(variations) < 2:
+        logging.warning("Less than two variations parsed from AI response. Using fallback variations.")
+        # Re-calling create_fallback_variations to ensure consistency
+        # Ensure 'Your Company', 'Your Product', 'a great offer', 'promotional' are consistent with your use case
+        fallback_result = create_fallback_variations("Your Company", "Your Product", "a great offer", "promotional")
+        # Extract variations from the fallback_result format
+        parsed_fallback = parse_email_variations(fallback_result[0]['generated_text']) # <--- Changed this line slightly
+        variations = parsed_fallback if len(parsed_fallback) >= 2 else [
+            {'subject': 'Exclusive Offer Inside 🎯', 'body': 'We have something special for you...\n\n[Learn More]'},
+            {'subject': 'You\'re Going to Love This', 'body': 'This is exactly what you\'ve been waiting for...\n\n[Discover More]'}
+        ]
+
+    return variations
+
 def generate_email_variations(company_name, product_name, offer_details, campaign_type, target_audience=""):
-    """Generate email variations using AI"""
+    """Generate email variations using AI with enhanced deliverability instructions"""
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 You are an expert email marketing copywriter specialized in high deliverability and engagement. Create two completely different marketing email variations for A/B testing. Each should have a unique, professional, and trustworthy approach and tone, designed to pass spam filters while maintaining high conversion potential.
@@ -383,25 +431,25 @@ Requirements for each email:
     - Professional, clear, concise, and persuasive.
     - Focus on benefits for the recipient.
     - Use natural language; avoid overly salesy or aggressive terms.
-    - **Crucially, avoid spam trigger words and phrases (e.g., "free money", "guaranteed income", excessive urgency unless genuinely applicable and communicated professionally).**
+    - **Crucially, avoid spam trigger words and phrases (e.g., "free money", "guaranteed income", excessive urgency unless genuinely applicable and communicated professionally).** # <--- NEW/UPDATED INSTRUCTION
     - Employ different psychological triggers for each variation (e.g., scarcity, social proof, fear of missing out, value proposition, problem/solution).
     - Clear and prominent call-to-action (CTA) with descriptive, trust-inspiring text (e.g., "Learn More about [Product Name]", "Get Your Free Guide").
     - Optimized for mobile reading (short paragraphs, good line breaks).
-    - **Include a clear and prominent unsubscribe link.** (You'll need to add this to your `create_email_message` function)
+    - **Include a clear and prominent unsubscribe instruction/link placeholder.** # <--- NEW INSTRUCTION
     - **Signature:** Professional closing with company name.
     - Minimal emoji use (0-2 maximum per email, only if it enhances the message).
-    - Maintain a good text-to-image ratio (primarily text).
+    - Maintain a good text-to-image ratio (primarily text). # <--- NEW INSTRUCTION
 - **Tone:** One variation could be direct and benefit-driven, the other more narrative or curiosity-driven.
 
 Format response strictly as:
 
 VARIATION A:
 SUBJECT: [subject line]
-BODY: [email content including a placeholder for an unsubscribe link like "[Unsubscribe Here]"]
+BODY: [email content]
 
 VARIATION B:
 SUBJECT: [subject line]
-BODY: [email content including a placeholder for an unsubscribe link like "[Unsubscribe Here]"]
+BODY: [email content]
 
 <|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
 
@@ -425,24 +473,29 @@ BODY: [email content including a placeholder for an unsubscribe link like "[Unsu
 
     return result
 
+    if 'error' in result:
+        logging.warning(f"Hugging Face API Error: {result['error']}. Generating fallback variations.")
+        return create_fallback_variations(company_name, product_name, offer_details, campaign_type)
+
+    return result
+
 def create_fallback_variations(company_name, product_name, offer_details, campaign_type):
     """Create fallback variations optimized for A/B testing, with better spam-filter avoidance."""
     logging.info("Creating fallback email variations with improved content.")
-
     variation_a = {
-        'subject': f'{product_name} from {company_name}: Special Invitation', # More professional
+        'subject': f'{product_name} from {company_name}: Special Invitation', # More professional # <--- UPDATED SUBJECT
         'body': f'''Dear Valued Customer,
 
 We are excited to introduce you to {product_name}, designed to help you with {offer_details}.
 
 Key benefits include:
-- Enhanced [Benefit 1 based on product/offer]
-- Streamlined [Benefit 2 based on product/offer]
-- Reliable [Benefit 3 based on product/offer]
+- Enhanced productivity # <--- UPDATED BODY CONTENT
+- Streamlined processes
+- Reliable support
 
 Discover how {product_name} can make a difference for you today.
 
-[Learn More About {product_name}]  # Clearer CTA
+[Learn More About {product_name}]
 
 Sincerely,
 The {company_name} Team
@@ -452,18 +505,18 @@ P.S. Explore the full features and benefits on our website.
     }
 
     variation_b = {
-        'subject': f'Unlock Your Potential with {product_name}', # Benefit-oriented
+        'subject': f'Unlock Your Potential with {product_name}', # Benefit-oriented # <--- UPDATED SUBJECT
         'body': f'''Hello,
 
 At {company_name}, we're always looking for ways to provide greater value. That's why we're delighted to share {product_name}, our latest innovation.
 
 This {campaign_type.lower()} is tailored to assist you with {offer_details}. Many customers are already experiencing positive results:
-"Absolutely transformed my workflow!" - A Happy User
+"Absolutely transformed my workflow!" - A Happy User # <--- UPDATED BODY CONTENT (Added social proof)
 "Simple, effective, and powerful." - Another Customer
 
 Ready to see how {product_name} can work for you?
 
-[Get Started with {product_name}] # Clearer CTA
+[Get Started with {product_name}]
 
 Warm regards,
 The {company_name} Team
@@ -472,10 +525,6 @@ P.S. We invite you to visit our site for a detailed overview.
 '''
     }
 
-    # Integrate the unsubscribe placeholder for the AI to fill, or add a generic one
-    # This assumes the AI *might* put it, but if not, your `create_email_message` will add one.
-    # For fallback, it's safer to have create_email_message add it reliably.
-    
     return [{"generated_text": f"VARIATION A:\nSUBJECT: {variation_a['subject']}\nBODY: {variation_a['body']}\n\nVARIATION B:\nSUBJECT: {variation_b['subject']}\nBODY: {variation_b['body']}"}]
 
 # API Routes
@@ -685,10 +734,8 @@ def send_campaign():
                 result = send_email_via_gmail(gmail_service, email_message)
 
                 if result['success']:
-                    print(f" > SUCCESS: Email sent. Waiting 5 seconds before clearing tracking timestamps.")
-                    # Add the 5-second delay here
-                    time.sleep(5)
-                    print(f" > Delay complete. Updating status to 'sent' and clearing tracking timestamps.")
+                    print(f" > SUCCESS: Email sent. Updating status to 'sent' and clearing tracking timestamps.")
+                    # Removed time.sleep(5) - it's generally not recommended in web server loops
                     # Update recipient status and explicitly set tracking timestamps to NULL for new tracking
                     cursor.execute(sql.SQL('''
                         UPDATE recipients
@@ -963,6 +1010,29 @@ def get_campaign_variants(campaign_id):
         if conn:
             conn.close()
 
+@app.route('/unsubscribe/<tracking_id>')
+def unsubscribe(tracking_id):
+    """Handle unsubscribe requests"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql.SQL('''
+            UPDATE recipients
+            SET status = 'unsubscribed', converted_at = CURRENT_TIMESTAMP -- Using converted_at to mark unsubscribe time, or add a dedicated column
+            WHERE tracking_id = %s
+        '''), [tracking_id])
+        conn.commit()
+        logging.info(f"Recipient {tracking_id} unsubscribed.")
+        # Render a simple confirmation page or redirect to a success page
+        return "You have successfully unsubscribed from our emails."
+    except Exception as e:
+        logging.error(f"Error unsubscribing {tracking_id}: {e}")
+        traceback.print_exc()
+        return "An error occurred during unsubscribe. Please try again or contact support."
+    finally:
+        if conn:
+            conn.close()
 
 @app.route('/integrate-content-template', methods=['POST'])
 def integrate_content_template():
@@ -1073,15 +1143,15 @@ def send_optimized_schedule():
             return jsonify({'success': False, 'error': 'No file selected'})
 
         subject = request.form.get('subject', '').strip()
-        html_body = request.form.get('html_body', '').strip()
+        html_body_content = request.form.get('html_body', '').strip() # Renamed from html_body for clarity
 
         logging.info(f"✅ Subject: {subject[:50] if subject else 'None'}...")
-        logging.info(f"✅ HTML body length: {len(html_body) if html_body else 0}")
+        logging.info(f"✅ HTML body length: {len(html_body_content) if html_body_content else 0}")
 
         if not subject:
             logging.error("❌ Subject is required for optimized send.")
             return jsonify({'success': False, 'error': 'Subject is required'})
-        if not html_body:
+        if not html_body_content: # Check the new variable
             logging.error("❌ HTML body is required for optimized send.")
             return jsonify({'success': False, 'error': 'HTML body is required'})
 
@@ -1089,7 +1159,7 @@ def send_optimized_schedule():
             file_content = file.read()
             file.seek(0)
             
-            encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252']
+            encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252'] # <--- Improved CSV decoding attempts
             df = None
             
             for encoding in encodings:
@@ -1098,7 +1168,7 @@ def send_optimized_schedule():
                     df = pd.read_csv(io.StringIO(file_string))
                     logging.info(f"✅ CSV loaded successfully with encoding: {encoding}")
                     break
-                except (UnicodeDecodeError, pd.errors.ParserError) as decode_error:
+                except (UnicodeDecodeError, pd.errors.ParserError) as decode_error: # <--- Catching ParserError too
                     logging.debug(f"Attempting decode with {encoding} failed: {decode_error}")
                     continue
             
@@ -1262,10 +1332,11 @@ def send_optimized_schedule():
                 try:
                     email_address = email_data['email'] # Renamed from 'email' to avoid conflict
                     
+                    # Ensure the html_body_content is passed as the body for both plain and HTML parts
                     msg = create_email_message(
                         to_email=email_address,
                         subject=subject,
-                        body=html_body, # Use 'body' for plain text part, html_body for HTML part
+                        body=html_body_content, # <--- THIS IS THE CRITICAL CHANGE: Pass the full HTML content
                         tracking_id=str(uuid.uuid4())
                     )
                     
